@@ -8,9 +8,9 @@ Cookbook recipes keep their model-specific launch commands inline. This page is 
 
 | Topic | Use it for |
 |---|---|
-| [Single-host Docker](/deployment/single-host-docker) | One TPU host such as v6e-4, v6e-8, or v7x-8. |
-| [GKE Indexed Job](/deployment/gke-indexed-job) | Multi-host TPU slices on GKE. |
-| [SkyPilot](/deployment/skypilot) | Advanced multi-host v6e experiments. |
-| [Troubleshooting](/deployment/troubleshooting) | Startup, multi-node, runtime, tokenizer, and cache failures shared across recipes. |
+| [Single-host Docker](../deployment/single-host-docker) | One TPU host such as v6e-4, v6e-8, or v7x-8. |
+| [GKE Indexed Job](../deployment/gke-indexed-job) | Multi-host TPU slices on GKE. |
+| [SkyPilot](../deployment/skypilot) | Advanced multi-host v6e experiments. |
+| [Troubleshooting](../deployment/troubleshooting) | Startup, multi-node, runtime, tokenizer, and cache failures shared across recipes. |
 
 The canonical Sphinx pages live under `docs/deployment/`; these cookbook pages are thin Mintlify-safe bridges for recipe links.

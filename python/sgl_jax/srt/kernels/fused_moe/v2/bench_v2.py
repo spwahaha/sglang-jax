@@ -264,7 +264,12 @@ if os.environ.get("BENCH_SINGLE_HOST", "0") != "1":
     jax.distributed.initialize()
 log(f"initialized: {jax.device_count()} devices, {jax.process_count()} procs")
 
-from kernel import FusedMoEBlockConfig, fused_ep_moe_v2, ref_moe
+from kernel import (
+    FusedMoEBlockConfig,
+    fused_ep_moe_v2,
+    ref_moe,
+    validate_fused_moe_a2a_mode,
+)
 from tune_prune import prune_candidates
 
 P = jax.sharding.PartitionSpec
@@ -277,6 +282,12 @@ d = int(os.environ.get("BENCH_D", "6144"))
 f = int(os.environ.get("BENCH_F", "2048"))
 E = int(os.environ.get("BENCH_E", "384"))
 top_k = int(os.environ.get("BENCH_TOPK", "8"))
+a2a_mode = validate_fused_moe_a2a_mode(os.environ.get("BENCH_A2A_MODE", "expert"))
+if a2a_mode == "rank_dispatch":
+    raise NotImplementedError(
+        "BENCH_A2A_MODE=rank_dispatch is reserved but its Pallas transport is not "
+        "implemented yet; refusing to benchmark the expert path under an optimized label."
+    )
 routing_mode = os.environ.get("BENCH_ROUTING_MODE", "random")
 routing_seed = int(os.environ.get("BENCH_ROUTING_SEED", "42"))
 bse = int(os.environ.get("BENCH_BSE", "256"))
@@ -346,6 +357,7 @@ if direct_scaled_dot:
 if enable_bt_scatter_overlap:
     log("bt_scatter_overlap=True (next-BT scatter HBM bank overlap)")
 log(f"cross_expert_prefetch={cross_expert_prefetch_modes}")
+log(f"a2a_mode={a2a_mode}")
 
 bt_candidates = parse_csv_int("BENCH_BT", [128])
 bf_candidates = parse_csv_int("BENCH_BF", [256])
@@ -1155,6 +1167,7 @@ for num_tokens in token_candidates:
                 cross_expert_prefetch_mode=xprefetch_mode,
                 fixed_gather_banks=fixed_gather_banks,
                 enable_bt_scatter_overlap=enable_bt_scatter_overlap,
+                a2a_mode=a2a_mode,
             )
 
         try:
@@ -1237,6 +1250,7 @@ if results:
                         "enable_act_quant": enable_act_quant,
                         "enable_bt_scatter_overlap": enable_bt_scatter_overlap,
                         "routing_mode": routing_mode,
+                        "a2a_mode": a2a_mode,
                         "block_config": tag,
                         "latency_ms": float(avg),
                         "latency_p50_ms": float(np.median(times)),
@@ -1293,6 +1307,7 @@ if check_correctness:
             enable_act_quant=enable_act_quant,
             fixed_gather_banks=fixed_gather_banks,
             enable_bt_scatter_overlap=enable_bt_scatter_overlap,
+            a2a_mode=a2a_mode,
         )
         ref_kwargs = {"swiglu_limit": SWIGLU_LIMIT, "shared_swiglu_limit": SHARED_SWIGLU_LIMIT}
         if use_fp8:

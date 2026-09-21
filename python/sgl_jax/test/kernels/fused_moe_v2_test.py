@@ -18,6 +18,7 @@ from sgl_jax.srt.kernels.fused_moe.v2.kernel import (
     FusedMoEBlockConfig,
     fused_ep_moe_v2,
     ref_moe,
+    validate_fused_moe_a2a_mode,
 )
 from sgl_jax.srt.layers.moe import TopK
 from sgl_jax.test.test_utils import create_device_mesh
@@ -115,7 +116,6 @@ def _quant_shared_w(w, w_dtype):
 
 @jtu.with_config(jax_numpy_dtype_promotion="standard")
 class MoEV2KernelTest(jtu.JaxTestCase):
-
     def setUp(self):
         super().setUp()
         # Mesh axes ("data", "tensor"); ep = data * tensor. Single line of devices
@@ -386,6 +386,12 @@ class MoEV2KernelTest(jtu.JaxTestCase):
         cfg = FusedMoEBlockConfig(bt=16, bf=512, btc=16, bse=512)
         with self.assertRaises(ValueError):
             cfg.effective_for(num_tokens=100, ep_size=8)  # 100 % 8 != 0
+
+    def test_a2a_mode_contract(self):
+        self.assertEqual(validate_fused_moe_a2a_mode("expert"), "expert")
+        self.assertEqual(validate_fused_moe_a2a_mode("rank_dispatch"), "rank_dispatch")
+        with self.assertRaisesRegex(ValueError, "Unsupported"):
+            validate_fused_moe_a2a_mode("auto")
 
 
 if __name__ == "__main__":

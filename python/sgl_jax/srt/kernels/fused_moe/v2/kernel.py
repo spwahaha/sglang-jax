@@ -15,6 +15,7 @@ import functools
 import math
 import os
 from dataclasses import dataclass
+from typing import Literal, cast
 
 import jax
 import jax.numpy as jnp
@@ -24,6 +25,9 @@ from jax.experimental.pallas import tpu as pltpu
 
 P = jax.sharding.PartitionSpec
 cdiv = pl.cdiv
+
+A2AMode = Literal["expert", "rank_dispatch"]
+SUPPORTED_A2A_MODES: tuple[A2AMode, ...] = ("expert", "rank_dispatch")
 
 
 # ---------------------------------------------------------------------------
@@ -77,6 +81,14 @@ class FusedMoEBlockConfig:
 # ---------------------------------------------------------------------------
 # Utilities
 # ---------------------------------------------------------------------------
+
+
+def validate_fused_moe_a2a_mode(a2a_mode: str) -> A2AMode:
+    """Validate the static fused-MoE communication-mode contract."""
+
+    if a2a_mode not in SUPPORTED_A2A_MODES:
+        raise ValueError(f"Unsupported {a2a_mode=}; expected one of {SUPPORTED_A2A_MODES}.")
+    return cast(A2AMode, a2a_mode)
 
 
 def align_to(x, a):
@@ -2417,6 +2429,7 @@ def _fused_ep_moe_kernel(
         "cross_expert_prefetch_mode",
         "fixed_gather_banks",
         "enable_act_quant",
+        "a2a_mode",
     ],
 )
 def fused_ep_moe_v2(
@@ -2459,9 +2472,16 @@ def fused_ep_moe_v2(
     # per-block banking. num_bt <= 1 (decode) => no overlap.
     fixed_gather_banks: int | None = 2,
     enable_act_quant: bool = False,
+    a2a_mode: A2AMode = "expert",
     dp_axis_name: str = "data",
     tp_axis_name: str = "tensor",
 ):
+    a2a_mode = validate_fused_moe_a2a_mode(a2a_mode)
+    if a2a_mode == "rank_dispatch":
+        raise NotImplementedError(
+            "a2a_mode='rank_dispatch' is reserved for the A2 Pallas proof of concept; "
+            "the rank-oriented transport is not implemented yet. Use a2a_mode='expert'."
+        )
     if cross_expert_prefetch_mode not in ("none", "full", "w13"):
         raise ValueError(
             f"Unsupported {cross_expert_prefetch_mode=}; "

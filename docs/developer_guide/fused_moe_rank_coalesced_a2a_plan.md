@@ -22,8 +22,10 @@ Current private implementation status on
 - complete for the small synthetic shape: one current-v2 TPU baseline run for
   every routing-pattern and token-count cell, including numerical reference
   checks per routing mode;
+- complete: A2 static `a2a_mode` API and benchmark plumbing, JSONL labelling,
+  validation test, and fail-fast unimplemented candidate mode;
 - pending: two more independent A1 repetitions, the realistic stress shape,
-  and all A2 Pallas work.
+  and the A2 rank-oriented Pallas transport.
 
 Verified TPU development environment:
 
@@ -57,8 +59,8 @@ actual latency or throughput improvement.
 | A1.2 controlled routes | Complete | One-, two-, four-, all-, and seeded-random generators implemented. |
 | A1.3 small TPU baseline | In progress | First full eight-cell run complete; collect two more independent runs. |
 | A1.3 realistic TPU stress shape | Not started | Run a fitting E=256 shape after baseline repetition automation is recorded. |
-| A1 acceptance gate | Partial | CPU and first TPU correctness run pass; repetition and stress criteria remain. |
-| A2 rank-dispatch POC | Not started | Next code milestone after A1 evidence is complete. |
+| A1 baseline checklist | Partial, non-blocking | CPU and first TPU correctness run pass; repetitions and stress data can continue alongside A2. |
+| A2 rank-dispatch POC | In progress | Static API/benchmark mode contract is implemented; Pallas transport is next. |
 | A2 semaphore/stress work | Not started | Depends on rank-oriented Pallas buffers and DMA implementation. |
 | A2 performance gate | Blocked on implementation | Requires expert-versus-rank_dispatch device-time A/B data. |
 | Stage B public RFC | Blocked on A2 gate | Do not open yet. |
@@ -70,8 +72,8 @@ actual latency or throughput improvement.
 
 ## Decision summary
 
-**Status: settled for the private proof of concept; no production API change has
-been made.**
+**Status: settled for the private proof of concept; no public server API or
+production behavior change has been made.**
 
 The proposed feature has two separately reviewable optimizations:
 
@@ -136,8 +138,9 @@ The optimization must preserve these invariants:
 
 ## Repository map
 
-**Status: evidence/test files exist; listed production files are planned A2 or
-later touch points and remain unchanged.**
+**Status: evidence/test files exist; the v2 kernel has only the defaulted static
+mode contract so far. Other listed production files remain planned A2 or later
+touch points.**
 
 ### Evidence and test code
 
@@ -167,8 +170,9 @@ model.
 
 ### Production code
 
-**Status: not modified.** The current private branch changes benchmark and test
-tooling only; `v2/kernel.py` still runs the expert-granular protocol.
+**Status: communication behavior is not modified.** `v2/kernel.py` accepts the
+defaulted static mode contract, but still runs only the expert-granular
+protocol; requesting `rank_dispatch` fails before compilation.
 
 - `python/sgl_jax/srt/kernels/fused_moe/v2/kernel.py`
   - `fused_ep_moe_v2`: validate and forward the static communication mode.
@@ -193,7 +197,8 @@ tooling only; `v2/kernel.py` still runs the expert-granular protocol.
 ## Stage A: private evidence branch
 
 **Status: in progress.** A1 CPU evidence and the first small-shape TPU baseline
-are complete. A1 repetition/stress work and all A2 implementation remain.
+are complete. A1 repetition/stress work can proceed alongside the A2 Pallas
+transport implementation.
 
 The private evidence branch is intentionally allowed to contain diagnostic
 code that would be reduced or reorganized before an upstream PR. It has two
@@ -462,9 +467,15 @@ Measure at least one decode-like and one prefill-like token bucket. Record:
 
 Do not use host wall time as the only kernel-performance number.
 
-#### A1 acceptance criteria
+#### A1 baseline checklist (non-blocking for A2 development)
 
-**Status: partially met.**
+**Status: partially met and no longer a prerequisite for starting A2.**
+
+A1 does not modify production kernel behavior, so it does not need to gate A2
+development. This checklist instead freezes a trustworthy control: identical
+routes, numerical reference, device-time method, payload accounting, and raw
+configuration. The public RFC remains gated on A2 results; A1 repetitions may
+run in parallel with A2 implementation.
 
 - Met: CPU tests pass without TPU initialization.
 - Met: deterministic predicted bytes match hand calculations.
@@ -487,9 +498,11 @@ metadata are cheaper than the avoided ICI payload.
 
 ### A2. Minimal rank-dispatch TPU proof-of-concept
 
-**Status: not started.** No production Pallas path or `a2a_mode` argument has
-been added. The verified VM and A1 harness are ready for this work after A1 is
-closed.
+**Status: in progress.** The static `a2a_mode` contract and
+`BENCH_A2A_MODE` plumbing are implemented. `expert` remains the default and is
+unchanged. `rank_dispatch` currently fails early with `NotImplementedError` so
+an expert-path run cannot be mislabeled as optimized. Rank-oriented Pallas
+transport is the next slice.
 
 #### Objective
 
@@ -536,10 +549,12 @@ the activation-payload benefit is demonstrated.
 
 #### Kernel work sequence
 
-**Status: steps 1-9 are pending.** Start with a benchmark-only static mode and
-keep the current expert branch as the A/B control.
+**Status: step 1 plumbing is complete; steps 2-9 remain.** The current expert
+branch remains the A/B control.
 
-1. Add `a2a_mode` to the v2 JIT static arguments and validation.
+1. Add `a2a_mode` to the v2 JIT static arguments and validation. **Complete:**
+   API default, benchmark environment variable, JSONL field, validation test,
+   and fail-fast placeholder are implemented.
 2. Preserve the existing `expert` branch byte-for-byte where practical.
 3. Derive destination rank and local expert ID for every valid route.
 4. Build a per-token destination mask and per-destination expert metadata.
@@ -808,7 +823,7 @@ evidence gate.
 
 ### Iterate privately
 
-**Status: active.** Finish A1 repetition/stress evidence, then implement the
+**Status: active.** Continue A1 repetition/stress evidence in parallel with the
 minimal benchmark-only A2 rank-dispatch path.
 
 Continue private work when correctness passes but performance is inconclusive,

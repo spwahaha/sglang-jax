@@ -23,6 +23,9 @@ Env vars:
   BENCH_WARMUP  — warmup iterations (default: 2)
   BENCH_ITERS   — timed iterations (default: 5)
   BENCH_CHECK   — 1 to run correctness check (single-host only)
+  BENCH_ROUTING_MODE — random, deterministic, hot_expert, one_rank,
+                       two_ranks, four_ranks, or all_ranks (default: random)
+  BENCH_ROUTING_SEED — seed for controlled/random CPU routing data (default: 42)
   BENCH_SWIGLU_LIMIT — SwiGLU clamp limit for routed experts (default: off)
   BENCH_SHARED_SWIGLU_LIMIT — SwiGLU clamp limit for the shared expert (default: off)
   BENCH_D/F/E/TOPK — model dims (default: MiMo V2 Pro)
@@ -46,6 +49,12 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from jax import lax
+
+from sgl_jax.tools.moe_rank_routing import (
+    calculate_rank_routing_metrics,
+    infer_contiguous_source_ranks,
+    make_controlled_topk,
+)
 
 t0 = time.time()
 KERNEL_NAME_RE = re.compile(r"fused-moe-v2-k_.*")
@@ -269,6 +278,7 @@ f = int(os.environ.get("BENCH_F", "2048"))
 E = int(os.environ.get("BENCH_E", "384"))
 top_k = int(os.environ.get("BENCH_TOPK", "8"))
 routing_mode = os.environ.get("BENCH_ROUTING_MODE", "random")
+routing_seed = int(os.environ.get("BENCH_ROUTING_SEED", "42"))
 bse = int(os.environ.get("BENCH_BSE", "256"))
 use_shared_expert = os.environ.get("BENCH_SHARED", "0") == "1"
 se_inter = int(os.environ.get("BENCH_SE_INTER", str(f)))
@@ -317,10 +327,12 @@ if invalid_modes:
         f"Unsupported BENCH_CROSS_EXPERT_PREFETCH values {invalid_modes}; "
         "expected one of none, full, or w13."
     )
-valid_routing_modes = {"random", "deterministic", "hot_expert"}
+controlled_routing_modes = {"one_rank", "two_ranks", "four_ranks", "all_ranks"}
+valid_routing_modes = {"random", "deterministic", "hot_expert", *controlled_routing_modes}
 if routing_mode not in valid_routing_modes:
     raise ValueError(
-        f"Unsupported BENCH_ROUTING_MODE={routing_mode!r}; expected one of random or deterministic."
+        f"Unsupported BENCH_ROUTING_MODE={routing_mode!r}; "
+        f"expected one of {sorted(valid_routing_modes)}."
     )
 if use_split:
     timeit_fn = None
@@ -777,6 +789,70 @@ def make_hot_expert_topk(num_tokens, top_k, num_experts, hot_frac=0.1, hot_load=
     return topk_weights, topk_ids
 
 
+def make_controlled_rank_topk(num_tokens, top_k, num_experts, pattern):
+    ids_np, weights_np = make_controlled_topk(
+        num_tokens=num_tokens,
+        top_k=top_k,
+        num_experts=num_experts,
+        ep_size=ep_size,
+        pattern=pattern,
+        seed=routing_seed,
+    )
+    local_tokens = num_tokens // num_devices
+    per_device_ids = []
+    per_device_weights = []
+    for i, dev in enumerate(jax.local_devices()):
+        global_device_id = jax.process_index() * len(jax.local_devices()) + i
+        token_start = global_device_id * local_tokens
+        token_end = token_start + local_tokens
+        per_device_ids.append(jax.device_put(jnp.asarray(ids_np[token_start:token_end]), dev))
+        per_device_weights.append(
+            jax.device_put(jnp.asarray(weights_np[token_start:token_end]), dev)
+        )
+    topk_ids = jax.make_array_from_single_device_arrays(
+        (num_tokens, top_k),
+        ep_sharding,
+        per_device_ids,
+    )
+    topk_weights = jax.make_array_from_single_device_arrays(
+        (num_tokens, top_k),
+        ep_sharding,
+        per_device_weights,
+    )
+    return topk_weights, topk_ids
+
+
+def make_random_topk(num_tokens, top_k, num_experts):
+    gating_local_shape = (num_tokens // num_devices, num_experts)
+    gating_per_dev = []
+    for i, dev in enumerate(jax.local_devices()):
+        shard_key = jax.random.fold_in(k5, jax.process_index() * len(jax.local_devices()) + i)
+        gating_per_dev.append(
+            jax.device_put(
+                jax.random.normal(shard_key, gating_local_shape, dtype=jnp.float32),
+                dev,
+            )
+        )
+    gating = jax.make_array_from_single_device_arrays(
+        (num_tokens, num_experts),
+        ep_sharding,
+        gating_per_dev,
+    )
+    _, topk_ids = lax.top_k(gating, top_k)
+    topk_logits = jnp.take_along_axis(gating, topk_ids, axis=-1)
+    return jax.nn.softmax(topk_logits, axis=-1), topk_ids
+
+
+def make_topk_for_routing_mode(num_tokens):
+    if routing_mode == "deterministic":
+        return make_deterministic_topk(num_tokens, top_k, E)
+    if routing_mode == "hot_expert":
+        return make_hot_expert_topk(num_tokens, top_k, E)
+    if routing_mode in controlled_routing_modes:
+        return make_controlled_rank_topk(num_tokens, top_k, E, routing_mode)
+    return make_random_topk(num_tokens, top_k, E)
+
+
 log("creating weight arrays...")
 w1 = make_sharded(k2, (E, d, f), jnp.bfloat16, 0.01)
 w2 = make_sharded(k3, (E, f, d), jnp.bfloat16, 0.01)
@@ -884,6 +960,7 @@ log("weights ready")
 
 # --- Sweep ---
 results: list[tuple[int, str, float, list[float]]] = []
+routing_metrics_by_tokens = {}
 
 for num_tokens in token_candidates:
     log(f"--- tokens={num_tokens} ---")
@@ -959,29 +1036,43 @@ for num_tokens in token_candidates:
             block_configs_to_try = _default_cfgs
 
     tokens = make_sharded(k1, (num_tokens, d), jnp.bfloat16)
-    if routing_mode == "deterministic":
-        topk_wts, topk_idx = make_deterministic_topk(num_tokens, top_k, E)
-    elif routing_mode == "hot_expert":
-        topk_wts, topk_idx = make_hot_expert_topk(num_tokens, top_k, E)
-    else:
-        gating_local_shape = (num_tokens // num_devices, E)
-        gating_per_dev = []
-        for i, dev in enumerate(jax.local_devices()):
-            shard_key = jax.random.fold_in(k5, jax.process_index() * len(jax.local_devices()) + i)
-            gating_per_dev.append(
-                jax.device_put(
-                    jax.random.normal(shard_key, gating_local_shape, dtype=jnp.float32),
-                    dev,
-                )
-            )
-        gating = jax.make_array_from_single_device_arrays(
-            (num_tokens, E),
-            ep_sharding,
-            gating_per_dev,
+    topk_wts, topk_idx = make_topk_for_routing_mode(num_tokens)
+
+    if routing_mode in controlled_routing_modes:
+        host_topk_ids, _ = make_controlled_topk(
+            num_tokens=num_tokens,
+            top_k=top_k,
+            num_experts=E,
+            ep_size=ep_size,
+            pattern=routing_mode,
+            seed=routing_seed,
         )
-        _, topk_idx = lax.top_k(gating, top_k)
-        topk_logits = jnp.take_along_axis(gating, topk_idx, axis=-1)
-        topk_wts = jax.nn.softmax(topk_logits, axis=-1)
+    elif jax.process_count() == 1:
+        host_topk_ids = np.asarray(jax.device_get(topk_idx))
+    else:
+        host_topk_ids = None
+
+    if host_topk_ids is not None:
+        routing_metrics = calculate_rank_routing_metrics(
+            host_topk_ids,
+            num_experts=E,
+            ep_size=ep_size,
+            hidden_size=d,
+            activation_dtype_bytes=jnp.dtype(jnp.bfloat16).itemsize,
+            source_ranks=infer_contiguous_source_ranks(num_tokens, ep_size),
+        )
+        routing_metrics_by_tokens[num_tokens] = routing_metrics
+        remote_reduction = routing_metrics.remote_dispatch_payload_reduction_ratio
+        remote_reduction_text = "n/a" if remote_reduction is None else f"{remote_reduction:.1%}"
+        log(
+            "  routing payload: "
+            f"expert_routes={routing_metrics.valid_expert_routes} "
+            f"unique_rank_routes={routing_metrics.unique_rank_routes} "
+            f"mean_ranks/token={routing_metrics.mean_unique_ranks_per_token:.3f} "
+            f"predicted_dispatch_reduction="
+            f"{routing_metrics.dispatch_payload_reduction_ratio:.1%} "
+            f"predicted_remote_reduction={remote_reduction_text}"
+        )
 
     configs_to_try = [
         (bc_raw, *flags)
@@ -1153,6 +1244,9 @@ if results:
                         "samples_ms": [float(t) for t in times],
                         "is_best_for_tokens": bool(avg == best_avg),
                     }
+                    routing_metrics = routing_metrics_by_tokens.get(nt)
+                    if routing_metrics is not None:
+                        record["routing_metrics"] = routing_metrics.as_dict()
                     fh.write(json.dumps(record, sort_keys=True) + "\n")
         log(f"wrote structured metrics to {metrics_path}")
 
@@ -1171,23 +1265,7 @@ if check_correctness:
         )
         nt0 = token_candidates[0]
         tokens_c = make_sharded(k1, (nt0, d), jnp.bfloat16)
-        gating_c_local = (nt0 // num_devices, E)
-        gating_c_dev = []
-        for i, dev in enumerate(jax.local_devices()):
-            sk = jax.random.fold_in(k5, jax.process_index() * len(jax.local_devices()) + i)
-            gating_c_dev.append(
-                jax.device_put(
-                    jax.random.normal(sk, gating_c_local, dtype=jnp.float32),
-                    dev,
-                )
-            )
-        gating_c = jax.make_array_from_single_device_arrays(
-            (nt0, E),
-            ep_sharding,
-            gating_c_dev,
-        )
-        _, tidx = lax.top_k(gating_c, top_k)
-        twts = jax.nn.softmax(jnp.take_along_axis(gating_c, tidx, axis=-1), axis=-1)
+        twts, tidx = make_topk_for_routing_mode(nt0)
 
         result = fused_ep_moe_v2(
             mesh,

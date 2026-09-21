@@ -2,9 +2,10 @@
 
 ## Status
 
-This document is a pre-RFC engineering plan. The initial evidence work should be
-developed and measured on a fork or private branch. It is not yet a proposal to
-change the public SGLang-JAX production default.
+**Last updated:** 2026-09-20 (America/Los_Angeles)
+
+This document is the live execution record for a private proof of concept. It
+is not yet a proposal to change the public SGLang-JAX production default.
 
 Current private implementation status on
 `codex/fused-moe-rank-coalesced-a2a`:
@@ -14,16 +15,63 @@ Current private implementation status on
 - complete: CPU tests for metadata preservation, exact payload formulas,
   invalid routes, duplicate experts, remote-only accounting, and weighted
   rank-partial equivalence;
-- complete but not TPU-executed: controlled-routing and JSONL payload reporting
-  wired into `bench_v2.py`;
-- pending TPU: current-v2 A1 measurements and all A2 Pallas work.
+- complete: CPU JSONL evidence generation, with current-v2 and candidate copy
+  counts labelled separately from physical ICI measurements;
+- complete: controlled-routing and JSONL payload reporting wired into
+  `bench_v2.py`;
+- complete for the small synthetic shape: one current-v2 TPU baseline run for
+  every routing-pattern and token-count cell, including numerical reference
+  checks per routing mode;
+- pending: two more independent A1 repetitions, the realistic stress shape,
+  and all A2 Pallas work.
+
+Verified TPU development environment:
+
+```text
+SSH target:       moe
+Checkout:         /home/gcpuser/sky_workdir/sglang-jax
+Remote branch:    codex/fused-moe-rank-coalesced-a2a
+Python:           .venv/bin/python
+JAX:              0.11.1
+Backend:          TPU
+Local devices:    4
+Remote base:      ae890f34 (upstream main at VM setup time)
+Remote commits:   cbbc1a1d, ccbeb906 (replayed evidence commits)
+Evidence:         /tmp/fused_moe_rank_a2a/*.jsonl
+```
+
+The local and TPU commit hashes differ because the two evidence commits were
+replayed onto the VM's newer clean `main`. The content is equivalent.
 
 The public RFC should be opened only after the evidence gate in this document is
 met. A baseline alone can demonstrate duplicated payload and establish a
 theoretical opportunity, but only a TPU proof-of-concept can demonstrate an
 actual latency or throughput improvement.
 
+## Section-by-section status
+
+| Section | Status | Latest evidence or next action |
+|---|---|---|
+| Decision, terminology, repository map | Settled for private POC | V2-first, static mode, no public flag before A2 passes. |
+| A1.1 CPU reference/accounting | Complete | 10/10 CPU tests pass locally and on the VM; eight JSONL records generated. |
+| A1.2 controlled routes | Complete | One-, two-, four-, all-, and seeded-random generators implemented. |
+| A1.3 small TPU baseline | In progress | First full eight-cell run complete; collect two more independent runs. |
+| A1.3 realistic TPU stress shape | Not started | Run a fitting E=256 shape after baseline repetition automation is recorded. |
+| A1 acceptance gate | Partial | CPU and first TPU correctness run pass; repetition and stress criteria remain. |
+| A2 rank-dispatch POC | Not started | Next code milestone after A1 evidence is complete. |
+| A2 semaphore/stress work | Not started | Depends on rank-oriented Pallas buffers and DMA implementation. |
+| A2 performance gate | Blocked on implementation | Requires expert-versus-rank_dispatch device-time A/B data. |
+| Stage B public RFC | Blocked on A2 gate | Do not open yet. |
+| Public PR 1 | Private equivalent complete | Clean up only after A1/A2 evidence justifies upstream discussion. |
+| Public PRs 2-4 | Not started | Dispatch, combine, then qualification remain separate changes. |
+| v6e-4 qualification | In progress | Current expert path baseline exists; optimized A/B does not. |
+| v7x/model/multi-host qualification | Not started | Deferred until the single-host A2 gate passes. |
+| Current go/no-go state | Iterate privately | Logical opportunity is proven; device speedup is not. |
+
 ## Decision summary
+
+**Status: settled for the private proof of concept; no production API change has
+been made.**
 
 The proposed feature has two separately reviewable optimizations:
 
@@ -50,6 +98,9 @@ v2 microbenchmark. The public implementation should expose it as
 `--fused-moe-a2a-mode`, defaulting to `expert` until qualification is complete.
 
 ## Terminology and invariants
+
+**Status: implemented in the CPU oracle and covered by unit tests; the Pallas
+candidate must still demonstrate these invariants on TPU.**
 
 For token `t`, let the router choose `K` expert IDs and weights:
 
@@ -85,7 +136,12 @@ The optimization must preserve these invariants:
 
 ## Repository map
 
+**Status: evidence/test files exist; listed production files are planned A2 or
+later touch points and remain unchanged.**
+
 ### Evidence and test code
+
+**Status: implemented and exercised on CPU and TPU benchmark paths.**
 
 - `python/sgl_jax/tools/moe_rank_routing.py` (new): controlled routing
   generators, a NumPy reference rank packer, logical payload accounting, and
@@ -111,6 +167,9 @@ model.
 
 ### Production code
 
+**Status: not modified.** The current private branch changes benchmark and test
+tooling only; `v2/kernel.py` still runs the expert-granular protocol.
+
 - `python/sgl_jax/srt/kernels/fused_moe/v2/kernel.py`
   - `fused_ep_moe_v2`: validate and forward the static communication mode.
   - `_fused_ep_moe_kernel`: allocate mode-specific scratch and run the selected
@@ -133,18 +192,31 @@ model.
 
 ## Stage A: private evidence branch
 
+**Status: in progress.** A1 CPU evidence and the first small-shape TPU baseline
+are complete. A1 repetition/stress work and all A2 implementation remain.
+
 The private evidence branch is intentionally allowed to contain diagnostic
 code that would be reduced or reorganized before an upstream PR. It has two
 milestones. Both are required before opening the public RFC.
 
 ### A1. Controlled-routing baseline
 
+**Status: in progress.** The controlled test harness is complete; the baseline
+needs two additional independent runs and a realistic stress shape.
+
 #### Objective
+
+**Status: partially achieved.** Duplication is quantified and a first current-v2
+latency baseline exists; repeatability and the realistic shape remain.
 
 Quantify the duplication opportunity and establish a reproducible current-v2
 latency baseline. This milestone does not change production kernel behavior.
 
 #### A1.1 CPU reference and payload accounting
+
+**Status: complete.** The implementation is in
+`python/sgl_jax/tools/moe_rank_routing.py`; all 10 CPU tests pass both locally
+and in the VM checkout.
 
 Implement a NumPy test oracle with an interface equivalent to:
 
@@ -218,12 +290,26 @@ This validates a real redundancy in the current algorithm on CPU. It does not
 prove a wall-clock speedup: physical ICI bytes, DMA granularity, added metadata
 cost, Pallas scheduling, and kernel latency still require a TPU run.
 
+The recorded `E=32, EP=4, K=8, H=1024, BF16` CPU results are:
+
+| Routing | Current-v2 copies/token | Candidate copies/token | Logical reduction |
+|---|---:|---:|---:|
+| one rank | 8 | 1 | 87.5% |
+| two ranks | 8 | 2 | 75.0% |
+| four ranks | 8 | 4 | 50.0% |
+| seeded random, 128 tokens | 8 | 3.758 mean | 53.0% |
+
+Artifact on the VM:
+`/tmp/fused_moe_rank_a2a/cpu_logical_payload.jsonl` (eight records).
+
 Payload numbers in A1 are analytical protocol bytes. They must be labelled
 `predicted_payload_bytes`, not presented as physical ICI counter measurements.
 DMA alignment, packetization, and implementation overhead may make physical
 traffic differ.
 
 #### A1.2 Controlled routing cases
+
+**Status: complete for the planned generators and deterministic fanout tests.**
 
 The minimum deterministic matrix is `E=32`, `EP=4`, `K=8`, with eight experts
 per rank:
@@ -273,6 +359,11 @@ Additional CPU cases:
 
 #### A1.3 TPU baseline
 
+**Status: partially complete.** The small synthetic shape has one full timing
+run. Each routing-mode benchmark process reported numerical `PASS`; the
+one-rank 128-token cell was also checked separately. Two more independent
+timing runs and the realistic stress shape remain.
+
 Use the repository's existing `bench_v2.py` synthetic-input path. It already
 creates random, sharded tokens and W1/W2/W3 expert tensors without a model
 checkpoint. Extend it with controlled routing and payload reporting:
@@ -304,6 +395,50 @@ BENCH_JSONL=/tmp/fused_moe_v2_one_rank.jsonl \
 python3 python/sgl_jax/srt/kernels/fused_moe/v2/bench_v2.py
 ```
 
+On the verified VM, use `.venv/bin/python` and explicitly select a valid local
+BT for the small shape:
+
+```bash
+ssh moe
+cd /home/gcpuser/sky_workdir/sglang-jax
+PYTHONPATH=python \
+BENCH_SINGLE_HOST=1 \
+BENCH_D=1024 BENCH_F=1024 BENCH_E=32 BENCH_TOPK=8 \
+BENCH_TOKENS=128,512 BENCH_BT=32 BENCH_BF=256 BENCH_BTC=32 \
+BENCH_WARMUP=2 BENCH_ITERS=5 BENCH_CHECK=1 \
+BENCH_ROUTING_MODE=four_ranks \
+BENCH_JSONL=/tmp/fused_moe_rank_a2a/current_v2_four_ranks.jsonl \
+.venv/bin/python python/sgl_jax/srt/kernels/fused_moe/v2/bench_v2.py
+```
+
+First-run current-v2 results (`bt=32, bf=256, btc=32, bts=32`, five device
+trace samples after two warmups):
+
+| Routing | Tokens | Current -> candidate copies | Remote copies | Predicted reduction | Device p50 |
+|---|---:|---:|---:|---:|---:|
+| one rank | 128 | 1024 -> 128 | 768 -> 96 | 87.5% | 0.071078 ms |
+| one rank | 512 | 4096 -> 512 | 3072 -> 384 | 87.5% | 0.269938 ms |
+| two ranks | 128 | 1024 -> 256 | 768 -> 192 | 75.0% | 0.071431 ms |
+| two ranks | 512 | 4096 -> 1024 | 3072 -> 768 | 75.0% | 0.268586 ms |
+| four ranks | 128 | 1024 -> 512 | 768 -> 384 | 50.0% | 0.071301 ms |
+| four ranks | 512 | 4096 -> 2048 | 3072 -> 1536 | 50.0% | 0.268500 ms |
+| seeded random | 128 | 1024 -> 481 | 776 -> 363 | 53.0% total, 53.2% remote | 0.094126 ms |
+| seeded random | 512 | 4096 -> 1919 | 3081 -> 1442 | 53.1% total, 53.2% remote | 0.411591 ms |
+
+These are baseline latencies for the unchanged `expert` protocol, not an A/B
+speedup result. The random-routing cells have different expert load and queue
+shapes, so their latency must not be attributed solely to rank fanout. Compare
+`expert` and `rank_dispatch` on identical routes only after A2 exists.
+
+Saved TPU artifacts:
+
+```text
+/tmp/fused_moe_rank_a2a/current_v2_one_rank.jsonl
+/tmp/fused_moe_rank_a2a/current_v2_two_ranks.jsonl
+/tmp/fused_moe_rank_a2a/current_v2_four_ranks.jsonl
+/tmp/fused_moe_rank_a2a/current_v2_random.jsonl
+```
+
 Repeat with `two_ranks`, `four_ranks`, and `random`. Preserve the JSONL files
 and the full console output as A1 evidence. These commands exercise the current
 `expert` kernel; A2 later adds the optimized A/B mode.
@@ -329,6 +464,16 @@ Do not use host wall time as the only kernel-performance number.
 
 #### A1 acceptance criteria
 
+**Status: partially met.**
+
+- Met: CPU tests pass without TPU initialization.
+- Met: deterministic predicted bytes match hand calculations.
+- Met for the first run: current expert kernel produces numerical-reference
+  `PASS` for every routing mode; independently check both token buckets in the
+  repetition script before closing A1.
+- Pending: three independent benchmark processes per cell after warmup.
+- Pending: realistic stress-shape data and device/host-time separation review.
+
 - CPU tests pass without a TPU runtime.
 - Predicted bytes match hand-calculated values for every deterministic case.
 - The existing `expert` kernel matches the existing numerical reference.
@@ -342,13 +487,21 @@ metadata are cheaper than the avoided ICI payload.
 
 ### A2. Minimal rank-dispatch TPU proof-of-concept
 
+**Status: not started.** No production Pallas path or `a2a_mode` argument has
+been added. The verified VM and A1 harness are ready for this work after A1 is
+closed.
+
 #### Objective
+
+**Status: unchanged.** This remains the next implementation objective.
 
 Demonstrate that rank-coalesced dispatch produces a real device-time benefit on
 at least one meaningful controlled-routing workload before requesting public
 project adoption.
 
 #### Scope
+
+**Status: planned, not implemented.**
 
 Add a kernel-only static mode to `fused_ep_moe_v2`:
 
@@ -360,6 +513,10 @@ Expose the mode through `bench_v2.py`, but do not yet add a production server
 flag or modify model constructors.
 
 #### Dispatch metadata
+
+**Status: CPU contract implemented; TPU encoding not selected.** The NumPy
+oracle proves which expert IDs, slots, and router weights must be preserved,
+but it intentionally does not claim metadata byte counts.
 
 For each source token, the Pallas implementation needs enough information to:
 
@@ -379,6 +536,9 @@ the activation-payload benefit is demonstrated.
 
 #### Kernel work sequence
 
+**Status: steps 1-9 are pending.** Start with a benchmark-only static mode and
+keep the current expert branch as the A/B control.
+
 1. Add `a2a_mode` to the v2 JIT static arguments and validation.
 2. Preserve the existing `expert` branch byte-for-byte where practical.
 3. Derive destination rank and local expert ID for every valid route.
@@ -391,6 +551,9 @@ the activation-payload benefit is demonstrated.
 9. Compare every output with the existing v2 reference.
 
 #### Semaphore correctness
+
+**Status: test contract defined; TPU implementation and stress execution are
+pending.**
 
 There is no single runtime `semaphore_leak_count`. Correctness is established
 by static accounting plus repeated TPU execution.
@@ -420,6 +583,10 @@ reuse is a correctness failure even if the first invocation succeeded.
 
 #### A2 benchmark protocol
 
+**Status: protocol defined; blocked on the rank-dispatch kernel mode.** The
+current benchmark already supplies identical controlled routes and JSONL
+output for the future A/B comparison.
+
 For every shape and routing pattern:
 
 1. Compile `expert` and `rank_dispatch` separately.
@@ -431,6 +598,9 @@ For every shape and routing pattern:
 7. Report metadata and scratch overhead alongside latency.
 
 #### A2 evidence gate
+
+**Status: not evaluated.** CPU evidence and current-v2 latency do not satisfy
+this gate; only a working `rank_dispatch` TPU path can do so.
 
 Open the public RFC only when all of the following hold:
 
@@ -455,6 +625,8 @@ public production flag for an optimization that has not demonstrated a device
 benefit.
 
 ## Stage B: public RFC
+
+**Status: blocked on the A2 evidence gate. Do not open the public issue yet.**
 
 After A2 passes, open an upstream SGLang-JAX issue before the production PR.
 
@@ -488,9 +660,14 @@ Reference adjacent work rather than claiming duplication:
 
 ## Stage C: upstream implementation PRs
 
+**Status: not started upstream.** The current branch is private evidence work.
+
 Public PRs should be smaller and cleaner than the private proof-of-concept.
 
 ### Public PR 1: reproducible baseline and reference contract
+
+**Status: private equivalent implemented and tested.** Defer upstream opening
+until A2 shows value, then clean the diagnostic branch into this bounded PR.
 
 Contents:
 
@@ -504,6 +681,8 @@ This PR makes the RFC evidence reproducible and gives later kernel PRs a stable
 oracle.
 
 ### Public PR 2: rank-coalesced dispatch
+
+**Status: not started; this corresponds to A2.**
 
 Contents:
 
@@ -519,6 +698,8 @@ The server flag belongs in this PR, because this is the first PR containing a
 production behavior that must be selectable for end-to-end testing.
 
 ### Public PR 3: destination-side partial combine
+
+**Status: not started and intentionally separated from dispatch.**
 
 Extend the mode set with:
 
@@ -543,6 +724,8 @@ gather layout, numerical ordering, scratch requirements, and semaphore counts.
 
 ### Public PR 4: qualification, tuning, and selection policy
 
+**Status: not started; blocked on PR 2 performance evidence.**
+
 Contents:
 
 - tuned block configurations keyed by communication mode if required;
@@ -558,7 +741,12 @@ and end-to-end evidence.
 
 ## End-to-end qualification matrix
 
+**Status: CPU qualification passes; v6e-4 current-path qualification is in
+progress; all optimized, model, v7x, and multi-host cells remain.**
+
 ### CPU
+
+**Status: pass (10/10 tests locally and on the VM).**
 
 - expert-to-rank mapping;
 - reference rank packing and unpacking;
@@ -569,6 +757,9 @@ and end-to-end evidence.
 
 ### v6e-4 synthetic TPU
 
+**Status: current expert-path small-shape baseline complete for one run;
+optimized A/B, repeatability, dtype expansion, and stress tests remain.**
+
 - v2 compile and numerical correctness;
 - controlled fanout A/B performance;
 - BF16 and the target checkpoint weight dtype;
@@ -578,11 +769,15 @@ and end-to-end evidence.
 
 ### v7x EP=8 synthetic TPU
 
+**Status: not started; no v7x resource is currently assigned.**
+
 - eight-rank fanout behavior;
 - comparison against both current v2 and EPMoE where relevant;
 - dense-fanout fallback behavior.
 
 ### v7x EP=8 model
+
+**Status: not started; deferred until synthetic A2 passes.**
 
 - MiMo-V2-Flash;
 - identical request set and serving configuration per mode;
@@ -592,24 +787,38 @@ and end-to-end evidence.
 
 ### Multi-host
 
+**Status: not started by design.**
+
 - deferred until single-host correctness and performance gates pass;
 - explicitly revalidate semaphore protocol and latency under cross-host ICI;
 - do not infer multi-host benefit solely from single-host payload reduction.
 
 ## Go/no-go outcomes
 
+**Current outcome: iterate privately.** CPU evidence proves logical copy
+redundancy and the VM baseline is healthy, but no optimized device-time result
+exists yet.
+
 ### Go
+
+**Status: not reached.**
 
 Open the public RFC and proceed with the public PR sequence when A2 passes its
 evidence gate.
 
 ### Iterate privately
 
+**Status: active.** Finish A1 repetition/stress evidence, then implement the
+minimal benchmark-only A2 rank-dispatch path.
+
 Continue private work when correctness passes but performance is inconclusive,
 especially if metadata format, local fanout copies, or buffer layout dominate.
 Change one variable at a time and retain the expert baseline.
 
 ### Stop
+
+**Status: not triggered.** No candidate kernel exists yet, so none of the stop
+conditions can be evaluated.
 
 Stop implementation and publish only findings if:
 
@@ -622,6 +831,8 @@ Stop implementation and publish only findings if:
 - scratch growth makes important production shapes infeasible.
 
 ## Out of scope for the first feature
+
+**Status: unchanged.** TPU VM availability does not expand the feature scope.
 
 - Changing expert placement or adding expert replication.
 - Replacing Top-K routing.

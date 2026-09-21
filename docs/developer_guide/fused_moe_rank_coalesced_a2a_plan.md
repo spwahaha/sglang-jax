@@ -504,6 +504,15 @@ unchanged. `rank_dispatch` currently fails early with `NotImplementedError` so
 an expert-path run cannot be mislabeled as optimized. Rank-oriented Pallas
 transport is the next slice.
 
+Verified on the TPU VM:
+
+- focused `test_a2a_mode_contract`: pass;
+- `BENCH_A2A_MODE=expert`, four-rank routing, 128 tokens: numerical reference
+  pass and 0.071 ms device p50, consistent with the pre-plumbing baseline;
+- emitted JSONL contains `"a2a_mode": "expert"`;
+- `BENCH_A2A_MODE=rank_dispatch` exits with the expected fail-fast error before
+  weights are allocated or a misleading benchmark record is written.
+
 #### Objective
 
 **Status: unchanged.** This remains the next implementation objective.
@@ -530,6 +539,22 @@ flag or modify model constructors.
 **Status: CPU contract implemented; TPU encoding not selected.** The NumPy
 oracle proves which expert IDs, slots, and router weights must be preserved,
 but it intentionally does not claim metadata byte counts.
+
+The next implementation slice will use fixed-capacity, banked structures:
+
+```text
+route mailbox: [bank, source_rank, bt, top_k] expert_id
+rank inbox:    [bank, source_rank, bt, hidden]
+rank mask:     [bt, ep_size] bool
+```
+
+For each token, the source emits one activation DMA for every true destination
+in `rank_mask`. The destination waits for all participating source-token
+entries, then uses the route mailbox to fan each rank-inbox activation into the
+existing expert-oriented queues. This deliberately keeps expert compute and
+the current gather unchanged for the first POC. Before device timing, a CPU
+contract test must prove that destination fanout produces the same per-expert
+token order and Top-K slot mapping as the current scatter.
 
 For each source token, the Pallas implementation needs enough information to:
 

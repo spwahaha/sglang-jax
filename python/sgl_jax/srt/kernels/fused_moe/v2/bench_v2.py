@@ -23,6 +23,8 @@ Env vars:
   BENCH_WARMUP  — warmup iterations (default: 2)
   BENCH_ITERS   — timed iterations (default: 5)
   BENCH_CHECK   — 1 to run correctness check (single-host only)
+  BENCH_A2A_MODE — expert or rank_dispatch (default: expert; rank_dispatch is
+                   fail-fast until the A2 Pallas transport is implemented)
   BENCH_ROUTING_MODE — random, deterministic, hot_expert, one_rank,
                        two_ranks, four_ranks, or all_ranks (default: random)
   BENCH_ROUTING_SEED — seed for controlled/random CPU routing data (default: 42)

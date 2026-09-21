@@ -8,6 +8,7 @@ import numpy as np
 
 from sgl_jax.tools.moe_rank_routing import (
     calculate_rank_routing_metrics,
+    generate_cpu_baseline_records,
     infer_contiguous_source_ranks,
     make_controlled_topk,
     reference_rank_combine,
@@ -163,6 +164,14 @@ class RankRoutingReferenceTest(unittest.TestCase):
         self.assertEqual(metrics.unique_remote_rank_routes, 12)
         self.assertAlmostEqual(metrics.remote_dispatch_payload_reduction_ratio, 0.5)
 
+        evidence = metrics.as_dict()
+        self.assertEqual(evidence["current_v2_dispatch_activation_copies"], 32)
+        self.assertEqual(evidence["candidate_rank_dispatch_activation_copies"], 16)
+        self.assertEqual(evidence["current_v2_return_activation_copies"], 32)
+        self.assertEqual(evidence["candidate_rank_combine_return_activation_copies"], 16)
+        self.assertEqual(evidence["current_v2_remote_dispatch_activation_copies"], 24)
+        self.assertEqual(evidence["candidate_remote_rank_dispatch_activation_copies"], 12)
+
     def test_random_pattern_is_reproducible_and_has_unique_experts(self):
         first_ids, first_weights = make_controlled_topk(
             num_tokens=16,
@@ -226,6 +235,34 @@ class RankRoutingReferenceTest(unittest.TestCase):
         self.assertEqual(metrics.valid_expert_routes, 0)
         self.assertEqual(metrics.unique_rank_routes, 0)
         self.assertEqual(metrics.dispatch_payload_reduction_ratio, 0.0)
+
+    def test_cpu_baseline_records_are_json_serializable_and_labelled_predicted(self):
+        records = generate_cpu_baseline_records(
+            patterns=["one_rank", "four_ranks"],
+            token_counts=[4],
+            top_k=8,
+            num_experts=32,
+            ep_size=4,
+            hidden_size=1024,
+            activation_dtype_bytes=2,
+        )
+
+        self.assertEqual(len(records), 2)
+        self.assertEqual(records[0]["evidence_type"], "predicted_logical_payload")
+        self.assertEqual(
+            records[0]["baseline_protocol"],
+            "current_v2_expert_route_scatter_and_gather",
+        )
+        self.assertEqual(
+            records[0]["measurement_scope"],
+            "cpu_route_trace_not_physical_ici_or_latency",
+        )
+        self.assertEqual(records[0]["current_v2_dispatch_activation_copies"], 32)
+        self.assertEqual(records[0]["candidate_rank_dispatch_activation_copies"], 4)
+        self.assertEqual(records[0]["dispatch_payload_reduction_ratio"], 0.875)
+        self.assertEqual(records[1]["current_v2_dispatch_activation_copies"], 32)
+        self.assertEqual(records[1]["candidate_rank_dispatch_activation_copies"], 16)
+        self.assertEqual(records[1]["dispatch_payload_reduction_ratio"], 0.5)
 
 
 if __name__ == "__main__":

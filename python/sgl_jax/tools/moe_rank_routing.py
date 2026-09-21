@@ -7,8 +7,12 @@ serving path must not call it.
 
 from __future__ import annotations
 
+import argparse
 import dataclasses
-from typing import Literal
+import json
+import pathlib
+import sys
+from typing import Literal, cast
 
 import numpy as np
 
@@ -72,6 +76,15 @@ class RankRoutingMetrics:
 
     def as_dict(self) -> dict[str, int | float | None]:
         result = dataclasses.asdict(self)
+        # The current v2 kernel scatters and gathers once per valid
+        # (token, Top-K slot).  The candidate transfers once per unique
+        # destination rank for that token.
+        result["current_v2_dispatch_activation_copies"] = self.valid_expert_routes
+        result["candidate_rank_dispatch_activation_copies"] = self.unique_rank_routes
+        result["current_v2_return_activation_copies"] = self.valid_expert_routes
+        result["candidate_rank_combine_return_activation_copies"] = self.unique_rank_routes
+        result["current_v2_remote_dispatch_activation_copies"] = self.remote_expert_routes
+        result["candidate_remote_rank_dispatch_activation_copies"] = self.unique_remote_rank_routes
         result["dispatch_payload_reduction_ratio"] = self.dispatch_payload_reduction_ratio
         result["remote_dispatch_payload_reduction_ratio"] = (
             self.remote_dispatch_payload_reduction_ratio
@@ -327,3 +340,120 @@ def make_controlled_topk(
     normalized = descending / descending.sum(dtype=np.float32)
     weights = np.broadcast_to(normalized, (num_tokens, top_k)).copy()
     return ids, weights
+
+
+def generate_cpu_baseline_records(
+    *,
+    patterns: list[RoutingPattern],
+    token_counts: list[int],
+    top_k: int,
+    num_experts: int,
+    ep_size: int,
+    hidden_size: int,
+    activation_dtype_bytes: int,
+    seed: int = 42,
+) -> list[dict[str, object]]:
+    """Generate JSON-serializable logical-payload records without JAX or TPU."""
+
+    records: list[dict[str, object]] = []
+    for num_tokens in token_counts:
+        source_ranks = infer_contiguous_source_ranks(num_tokens, ep_size)
+        for pattern in patterns:
+            topk_ids, _ = make_controlled_topk(
+                num_tokens=num_tokens,
+                top_k=top_k,
+                num_experts=num_experts,
+                ep_size=ep_size,
+                pattern=pattern,
+                seed=seed,
+            )
+            metrics = calculate_rank_routing_metrics(
+                topk_ids,
+                num_experts=num_experts,
+                ep_size=ep_size,
+                hidden_size=hidden_size,
+                activation_dtype_bytes=activation_dtype_bytes,
+                source_ranks=source_ranks,
+            )
+            records.append(
+                {
+                    "evidence_type": "predicted_logical_payload",
+                    "baseline_protocol": "current_v2_expert_route_scatter_and_gather",
+                    "candidate_protocol": "rank_coalesced_scatter_and_weighted_rank_combine",
+                    "measurement_scope": "cpu_route_trace_not_physical_ici_or_latency",
+                    "routing_pattern": pattern,
+                    "seed": seed,
+                    "num_tokens": num_tokens,
+                    "num_experts": num_experts,
+                    "ep_size": ep_size,
+                    "top_k": top_k,
+                    "hidden_size": hidden_size,
+                    "activation_dtype_bytes": activation_dtype_bytes,
+                    **metrics.as_dict(),
+                }
+            )
+    return records
+
+
+def _parse_csv_ints(value: str) -> list[int]:
+    return [int(item.strip()) for item in value.split(",") if item.strip()]
+
+
+def _parse_patterns(value: str) -> list[RoutingPattern]:
+    supported = {"one_rank", "two_ranks", "four_ranks", "all_ranks", "random"}
+    patterns = [item.strip() for item in value.split(",") if item.strip()]
+    invalid = sorted(set(patterns) - supported)
+    if invalid:
+        raise argparse.ArgumentTypeError(
+            f"unsupported patterns {invalid}; expected values from {sorted(supported)}"
+        )
+    return cast(list[RoutingPattern], patterns)
+
+
+def _build_argument_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Generate CPU-only rank-coalesced MoE logical-payload evidence."
+    )
+    parser.add_argument(
+        "--patterns",
+        type=_parse_patterns,
+        default=_parse_patterns("one_rank,two_ranks,four_ranks,random"),
+    )
+    parser.add_argument("--token-counts", type=_parse_csv_ints, default=[128, 512])
+    parser.add_argument("--top-k", type=int, default=8)
+    parser.add_argument("--num-experts", type=int, default=32)
+    parser.add_argument("--ep-size", type=int, default=4)
+    parser.add_argument("--hidden-size", type=int, default=1024)
+    parser.add_argument("--activation-dtype-bytes", type=int, default=2)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--output",
+        type=pathlib.Path,
+        help="Write JSONL to this path; omit to print JSONL to stdout.",
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _build_argument_parser().parse_args(argv)
+    records = generate_cpu_baseline_records(
+        patterns=args.patterns,
+        token_counts=args.token_counts,
+        top_k=args.top_k,
+        num_experts=args.num_experts,
+        ep_size=args.ep_size,
+        hidden_size=args.hidden_size,
+        activation_dtype_bytes=args.activation_dtype_bytes,
+        seed=args.seed,
+    )
+    lines = [json.dumps(record, sort_keys=True) for record in records]
+    if args.output is None:
+        sys.stdout.write("\n".join(lines) + ("\n" if lines else ""))
+    else:
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

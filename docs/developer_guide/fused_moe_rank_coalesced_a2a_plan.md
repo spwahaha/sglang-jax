@@ -184,6 +184,40 @@ Do not report metadata bytes until A2 selects a concrete fixed-capacity encoding
 and field widths. A1 can report the number of route entries that the eventual
 encoding must represent.
 
+Generate the initial CPU-only JSONL evidence from the repository root:
+
+```bash
+PYTHONPATH=python UV_CACHE_DIR=/tmp/sgljax-rank-a2a-uv-cache \
+  uv run --with numpy==2.2.6 -- python -m sgl_jax.tools.moe_rank_routing \
+  --patterns one_rank,two_ranks,four_ranks,random \
+  --token-counts 128,512 \
+  --top-k 8 --num-experts 32 --ep-size 4 \
+  --hidden-size 1024 --activation-dtype-bytes 2 \
+  --output /tmp/fused_moe_rank_routing_cpu.jsonl
+```
+
+This command requires NumPy but does not import JAX, initialize a TPU runtime,
+or allocate model weights. Each record is explicitly labelled
+`predicted_logical_payload` to distinguish analytical bytes from physical ICI
+counters and measured kernel latency.
+
+The CPU baseline mirrors the checked-in v2 protocol, rather than assuming a
+generic MoE implementation:
+
+- `start_a2a_scatter_batch_range` in `v2/kernel.py` iterates every token and
+  every Top-K slot, then starts one local or remote activation copy for that
+  expert route;
+- `start_a2a_gather` sends each local expert's output back to every source rank
+  that routed tokens to it;
+- therefore `current_v2_*_activation_copies` is the exact logical element-copy
+  count implied by the current routing loops;
+- `candidate_rank_*_activation_copies` deduplicates those same routes only by
+  destination rank. No expert route is removed from expert computation.
+
+This validates a real redundancy in the current algorithm on CPU. It does not
+prove a wall-clock speedup: physical ICI bytes, DMA granularity, added metadata
+cost, Pallas scheduling, and kernel latency still require a TPU run.
+
 Payload numbers in A1 are analytical protocol bytes. They must be labelled
 `predicted_payload_bytes`, not presented as physical ICI counter measurements.
 DMA alignment, packetization, and implementation overhead may make physical

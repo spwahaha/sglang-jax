@@ -2,6 +2,9 @@
 
 Experiments, results, and engineering conclusions
 
+For dispatch, broadcast, and return traffic alone, see the separate
+[communication report](COMMUNICATION.md).
+
 Research snapshot prepared on 2026-10-18. Implementation snapshot:
 [`5448acf1`](https://github.com/spwahaha/sglang-jax/commit/5448acf11e0826efa36b65191ada1590ecb60336).
 
@@ -169,7 +172,7 @@ On v6e-4 with BF16, random routing, `H=8192`, `I=1024`, `E=32`, `K=8`, EP=4:
 |---:|---:|---:|---|
 | 32 | 0.303173 | 0.288712 | 4.77 percent lower latency |
 | 64 | 0.313143 | 0.300163 | 4.15 percent lower latency |
-| 128 | 0.448801 | 0.445009 | 0.84 percent lower latency |
+| 128 | 0.448801 | 0.445009 | 0.85 percent lower latency |
 | 256 | 0.949149 | 0.953810 | 0.49 percent higher latency |
 | 512 | 2.006105 | 2.037165 | 1.55 percent higher latency |
 

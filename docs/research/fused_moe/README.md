@@ -1,7 +1,12 @@
 # TPU fused MoE experiments and analysis
 
-Start with the [research report](REPORT.md) for the purpose, implementation,
-experiments, results, causal analysis, and proposed next steps.
+Start with the [communication report](COMMUNICATION.md) for rank deduplication,
+direct-row dispatch, dense rank broadcast, and destination-side combine. It
+explains why we tried each design, what we implemented, what the measurements
+show, and which explanations still need independent experiments.
+
+The [broader research report](REPORT.md) also covers block tuning, VMEM search,
+and other kernel findings.
 
 This branch preserves experimental Pallas fused-MoE v2 code, controlled-routing
 experiments, tuning tools, and the reasoning behind the resulting design

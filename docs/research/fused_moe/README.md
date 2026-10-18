@@ -1,5 +1,8 @@
 # TPU fused MoE experiments and analysis
 
+Start with the [research report](REPORT.md) for the purpose, implementation,
+experiments, results, causal analysis, and proposed next steps.
+
 This branch preserves experimental Pallas fused-MoE v2 code, controlled-routing
 experiments, tuning tools, and the reasoning behind the resulting design
 choices. It is a research snapshot; it has not been promoted upstream or
@@ -52,8 +55,9 @@ experiments. These results guide subsequent layout and synchronization work;
 logical payload models do not establish physical ICI traffic or serving gains.
 
 The [evidence directory](evidence/) includes unmodified JSONL records for the
-six MiMo timing runs and rank-broadcast crossover/repeat experiments, plus the
-historical MiMo selector report. The [SHA256 manifest](evidence/manifest.json)
+six MiMo timing runs, rank-broadcast crossover/repeat experiments, and clean
+v6e-4 decode/prefill comparisons, plus their historical selector reports.
+The [SHA256 manifest](evidence/manifest.json)
 records every copied evidence file. Files have descriptive names instead of
 host identifiers; record contents and provenance fields are unchanged.
 Full historical archives referenced in the older developer notes remain local;

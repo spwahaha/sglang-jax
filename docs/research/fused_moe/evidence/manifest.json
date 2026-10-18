@@ -88,5 +88,89 @@
     "sha256": "7dba22e7e2313ec68370a887b557c98a9db8d0e8d944894ff448dd0d575c19ef",
     "bytes": 23672,
     "copied_without_modification": true
+  },
+  {
+    "file": "clean-v6e4-decode-prod-baseline-1.jsonl",
+    "sha256": "2776786bf8c426a01df6bcf1e10945b242f8ea091144670d98b090f0d0266578",
+    "bytes": 6523,
+    "copied_without_modification": true
+  },
+  {
+    "file": "clean-v6e4-decode-prod-baseline-2.jsonl",
+    "sha256": "883e074f935e32e829fa4f4a77fa478f36c662b3c0b1bebfc2cca1caad1c45eb",
+    "bytes": 6522,
+    "copied_without_modification": true
+  },
+  {
+    "file": "clean-v6e4-decode-prod-baseline-3.jsonl",
+    "sha256": "c67c2de3a999055b9981371974c9846739074cf435981e6afac391de145e7e52",
+    "bytes": 6528,
+    "copied_without_modification": true
+  },
+  {
+    "file": "clean-v6e4-decode-selection.json",
+    "sha256": "9048d73f431e3b393bb0b754d31c72f692ac717d3e41749c7b903fd3069ac274",
+    "bytes": 11160,
+    "copied_without_modification": true
+  },
+  {
+    "file": "clean-v6e4-decode-tuned-candidate-1.jsonl",
+    "sha256": "a9c9004b531e0507331c62a6858a79f21b6d46c9ee5c1817a2fc51ae6e7421f6",
+    "bytes": 6513,
+    "copied_without_modification": true
+  },
+  {
+    "file": "clean-v6e4-decode-tuned-candidate-2.jsonl",
+    "sha256": "ae88603a548b22bfb8f2056ce92dcbab95d03203d12f8e33db6ec2b71c2cd638",
+    "bytes": 6520,
+    "copied_without_modification": true
+  },
+  {
+    "file": "clean-v6e4-decode-tuned-candidate-3.jsonl",
+    "sha256": "49869c76a7ea09853f3144e1220d9bce1326105f01f69b9d0ab4450b045b5f26",
+    "bytes": 6508,
+    "copied_without_modification": true
+  },
+  {
+    "file": "clean-v6e4-prefill-production-baseline-2.jsonl",
+    "sha256": "b9f8c7a5dca6d6e016715b19892b5a1be1c0c820338a9feaf30dea98ffc6e4ad",
+    "bytes": 6697,
+    "copied_without_modification": true
+  },
+  {
+    "file": "clean-v6e4-prefill-production-baseline-3.jsonl",
+    "sha256": "02e90f355c3f5db314212ee4897d554021b736761499f467cc4bdc380c031b3d",
+    "bytes": 4983,
+    "copied_without_modification": true
+  },
+  {
+    "file": "clean-v6e4-prefill-production-baseline-4.jsonl",
+    "sha256": "6b902cdea5ff1833a7af7a5bad0f5fd30d6f3cce4cdb3c3016243d5f3210cd70",
+    "bytes": 4987,
+    "copied_without_modification": true
+  },
+  {
+    "file": "clean-v6e4-prefill-winner-2.jsonl",
+    "sha256": "486791f4e897ad63552feb5ef6c7f83099b546057fa9fd0775957aa53cdeee86",
+    "bytes": 4961,
+    "copied_without_modification": true
+  },
+  {
+    "file": "clean-v6e4-prefill-winner-3.jsonl",
+    "sha256": "46df057baab8a84d5dffb9b1d0f7e3956b04a8922d12d96e7c810b71cf5d26c9",
+    "bytes": 4942,
+    "copied_without_modification": true
+  },
+  {
+    "file": "clean-v6e4-prefill-winner-grouped-reference.jsonl",
+    "sha256": "057bd45f2b6e5e5d86fe7ef5df08d304e1cda19497f96429f86c4e934fdd592f",
+    "bytes": 6696,
+    "copied_without_modification": true
+  },
+  {
+    "file": "clean-v6e4-prefill-selection.json",
+    "sha256": "da0016950570b06a0bfabc7e4ee948cb27967175de5ee00320dec13f40f9a4c5",
+    "bytes": 11233,
+    "copied_without_modification": true
   }
 ]

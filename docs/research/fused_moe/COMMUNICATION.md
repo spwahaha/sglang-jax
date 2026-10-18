@@ -7,10 +7,15 @@ Research report prepared on 2026-10-18. Code preserved in
 
 ## Purpose and main finding
 
-We explored how to reduce expert-parallel all-to-all communication in SGLang-JAX's fused
-mixture-of-experts kernel on TPU. We built rank-deduplicated dispatch,
-direct-row diagnostics, dense rank broadcast, and destination-side combine
-prototypes, then compared their numerical behavior and whole-kernel latency.
+In expert-parallel MoE, a router selects `K` experts per token. Dispatch sends
+activations to the ranks that own those experts; the experts compute their
+outputs, then return them to the source rank for a router-weighted sum.
+SGLang-JAX's existing TPU path transfers one activation row per selected expert,
+so experts on the same rank can receive repeated copies of the same token.
+This creates an opportunity to send one copy per destination rank and reuse it
+locally. We explored that opportunity through rank-deduplicated dispatch,
+direct-row diagnostics, dense rank broadcast, and destination-side combine,
+comparing numerical behavior and whole-kernel latency.
 
 Broadcast asked a specific question: could a few regular dense transfers beat
 precise rank deduplication once packing and local rearrangement were included?
@@ -26,11 +31,7 @@ Block tuning, VMEM search, and other kernel findings remain in the
 
 ### The baseline already performs useful work during communication
 
-The router selects `K` experts for each token. An expert-parallel rank owns
-several experts, so one token may select multiple experts on the same rank.
-The existing `expert` path sends one activation row per selected expert.
-
-Each DMA writes directly into that expert's final input queue. Its destination
+Each dispatch DMA writes directly into the destination expert's final input queue. Its destination
 address performs the routing permutation, so compute can load contiguous rows
 without a separate rank-to-expert rearrangement. Receive readiness is tracked
 per expert: one expert can begin computing while another is still receiving.

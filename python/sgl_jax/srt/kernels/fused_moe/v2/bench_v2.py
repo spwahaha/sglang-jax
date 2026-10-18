@@ -13,9 +13,12 @@ Env vars:
   BENCH_FP8     — 1 to enable fp8 weights
   BENCH_QBK     — quant_block_k for fp8 (default: 128)
   BENCH_DIRECT_SCALED_DOT — 1 to use direct-scaled-dot for both FFN1/FFN2
+  BENCH_TAIL_AWARE_BTC — 0, 1, or 0,1 to compare static versus tail-aware btc
+                         loop bounds (default: 0)
   BENCH_GATHER_BANKS — fixed rotating gather banks K (default: 2); gather-compute
                        overlap is unconditional for num_bt > 1
   BENCH_VARIANT — label written to BENCH_JSONL for ablation tracking
+  BENCH_RUN_ID  — independent-run label written to BENCH_JSONL
   BENCH_TUNE    — 1 to auto-generate bt/bf candidates
   BENCH_MAX_CONFIGS — maximum auto-tune candidates per token shape (default: 48)
   BENCH_TUNE_VMEM_HEADROOM — VMEM budget ratio used by the tuner (default: 0.95)
@@ -23,8 +26,11 @@ Env vars:
   BENCH_WARMUP  — warmup iterations (default: 2)
   BENCH_ITERS   — timed iterations (default: 5)
   BENCH_CHECK   — 1 to run correctness check (single-host only)
-  BENCH_A2A_MODE — expert or rank_dispatch (default: expert; rank_dispatch is
-                   fail-fast until the A2 Pallas transport is implemented)
+  BENCH_A2A_MODE — expert, rank_direct, rank_broadcast, rank_dispatch, or
+                   rank_dispatch_combine
+                   (default: expert)
+  BENCH_WORKLOAD_REGIME — auto, latency, or throughput (default: auto)
+  BENCH_FORWARD_MODE — scheduler stage label stored in evidence (default: SYNTHETIC)
   BENCH_ROUTING_MODE — random, deterministic, hot_expert, one_rank,
                        two_ranks, four_ranks, or all_ranks (default: random)
   BENCH_ROUTING_SEED — seed for controlled/random CPU routing data (default: 42)
@@ -43,7 +49,7 @@ import os
 import pathlib
 import re
 import shutil
-import sys
+import subprocess
 import time
 from typing import Any
 
@@ -53,6 +59,10 @@ import numpy as np
 from jax import lax
 
 from sgl_jax.tools.moe_rank_routing import (
+    calculate_expert_btc_work,
+    calculate_expert_gather_launches,
+    calculate_packed_rank_dispatch_launches,
+    calculate_rank_broadcast_traffic,
     calculate_rank_routing_metrics,
     infer_contiguous_source_ranks,
     make_controlled_topk,
@@ -65,6 +75,29 @@ TRACE_ROOT = "/tmp/tpu_logs/v2_trace"
 
 def log(msg):
     print(f"[{time.time() - t0:.1f}s][p{jax.process_index()}] {msg}", flush=True)
+
+
+def _git_provenance() -> tuple[str | None, bool | None]:
+    """Return revision and dirty state without making benchmark startup fatal."""
+
+    try:
+        revision = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        dirty = bool(
+            subprocess.run(
+                ["git", "status", "--porcelain"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+        )
+        return revision, dirty
+    except (OSError, subprocess.CalledProcessError):
+        return None, None
 
 
 # ---------------------------------------------------------------------------
@@ -273,23 +306,26 @@ from kernel import (
     validate_fused_moe_a2a_mode,
 )
 from tune_prune import prune_candidates
+from vmem_model import (
+    FUSED_MOE_V2_VMEM_LIMIT_BYTES,
+    build_fused_moe_v2_scratch_plan,
+    estimate_fused_moe_v2_vmem,
+    validate_fused_moe_v2_vmem_budget,
+)
 
 P = jax.sharding.PartitionSpec
 num_devices = jax.device_count()
 devices = np.array(jax.devices()).reshape(1, num_devices)
 mesh = jax.sharding.Mesh(devices, ("data", "tensor"))
 ep_size = num_devices
+git_revision, git_dirty = _git_provenance()
+device_kind = jax.devices()[0].device_kind
 
 d = int(os.environ.get("BENCH_D", "6144"))
 f = int(os.environ.get("BENCH_F", "2048"))
 E = int(os.environ.get("BENCH_E", "384"))
 top_k = int(os.environ.get("BENCH_TOPK", "8"))
 a2a_mode = validate_fused_moe_a2a_mode(os.environ.get("BENCH_A2A_MODE", "expert"))
-if a2a_mode == "rank_dispatch":
-    raise NotImplementedError(
-        "BENCH_A2A_MODE=rank_dispatch is reserved but its Pallas transport is not "
-        "implemented yet; refusing to benchmark the expert path under an optimized label."
-    )
 routing_mode = os.environ.get("BENCH_ROUTING_MODE", "random")
 routing_seed = int(os.environ.get("BENCH_ROUTING_SEED", "42"))
 bse = int(os.environ.get("BENCH_BSE", "256"))
@@ -314,15 +350,39 @@ tune_max_configs = int(os.environ.get("BENCH_MAX_CONFIGS", "48"))
 tune_vmem_headroom = float(os.environ.get("BENCH_TUNE_VMEM_HEADROOM", "0.95"))
 metrics_jsonl = os.environ.get("BENCH_JSONL")
 benchmark_variant = os.environ.get("BENCH_VARIANT", "fused_moe_v2_tune")
+benchmark_run_id = os.environ.get("BENCH_RUN_ID", f"run-{int(t0)}")
+forward_mode_label = os.environ.get("BENCH_FORWARD_MODE", "SYNTHETIC").upper()
+_valid_forward_modes = {
+    "SYNTHETIC",
+    "EXTEND",
+    "DECODE",
+    "MIXED",
+    "IDLE",
+    "TARGET_VERIFY",
+    "DRAFT_EXTEND",
+    "DUMMY_FIRST",
+}
+if forward_mode_label not in _valid_forward_modes:
+    raise ValueError(
+        f"Unsupported BENCH_FORWARD_MODE={forward_mode_label!r}; "
+        f"expected one of {sorted(_valid_forward_modes)}"
+    )
+_workload_regime_value = os.environ.get("BENCH_WORKLOAD_REGIME", "auto")
+if _workload_regime_value not in ("auto", "latency", "throughput"):
+    raise ValueError(
+        f"Unsupported BENCH_WORKLOAD_REGIME={_workload_regime_value!r}; "
+        "expected auto, latency, or throughput"
+    )
 _explicit_block_shape = any(
     os.environ.get(k) is not None for k in ("BENCH_BT", "BENCH_BF", "BENCH_BTC", "BENCH_BTS")
 )
 auto_tuned_block = (not tune_mode) and (not _explicit_block_shape)
-if auto_tuned_block:
-    from sgl_jax.srt.kernels.fused_moe.v2.tuned_block_configs import (
-        DEFAULT_V2_BLOCK_CONFIG,
-        get_tuned_fused_moe_v2_block_config,
-    )
+from sgl_jax.srt.kernels.fused_moe.v2.tuned_block_configs import (
+    MoeWorkloadRegime,
+    get_tuned_fused_moe_v2_block_config,
+)
+
+workload_regime = MoeWorkloadRegime(_workload_regime_value)
 use_wall = os.environ.get("BENCH_WALL", "0") == "1"
 use_split = os.environ.get("BENCH_SPLIT", "0") == "1"
 direct_scaled_dot = os.environ.get("BENCH_DIRECT_SCALED_DOT", "0") == "1"
@@ -340,6 +400,10 @@ if invalid_modes:
         f"Unsupported BENCH_CROSS_EXPERT_PREFETCH values {invalid_modes}; "
         "expected one of none, full, or w13."
     )
+tail_aware_btc_values_raw = parse_csv_int("BENCH_TAIL_AWARE_BTC", [0])
+if any(value not in (0, 1) for value in tail_aware_btc_values_raw):
+    raise ValueError("BENCH_TAIL_AWARE_BTC accepts only comma-separated 0 or 1 values.")
+tail_aware_btc_values = [bool(value) for value in tail_aware_btc_values_raw]
 controlled_routing_modes = {"one_rank", "two_ranks", "four_ranks", "all_ranks"}
 valid_routing_modes = {"random", "deterministic", "hot_expert", *controlled_routing_modes}
 if routing_mode not in valid_routing_modes:
@@ -359,7 +423,10 @@ if direct_scaled_dot:
 if enable_bt_scatter_overlap:
     log("bt_scatter_overlap=True (next-BT scatter HBM bank overlap)")
 log(f"cross_expert_prefetch={cross_expert_prefetch_modes}")
+log(f"tail_aware_btc={tail_aware_btc_values}")
 log(f"a2a_mode={a2a_mode}")
+log(f"workload_regime={workload_regime}")
+log(f"forward_mode={forward_mode_label}")
 
 bt_candidates = parse_csv_int("BENCH_BT", [128])
 bf_candidates = parse_csv_int("BENCH_BF", [256])
@@ -415,7 +482,14 @@ def _aligned_divisors(n, alignment=8):
     return sorted(divs, reverse=True)
 
 
-def _estimate_vmem_bytes_v2(
+def _block_config_signature(config):
+    """Compare configs by values even when direct execution loads two classes."""
+    if config is None:
+        return None
+    return tuple(getattr(config, field) for field in ("bt", "bf", "btc", "bse", "bts"))
+
+
+def _estimate_vmem_v2(
     *,
     bt,
     bf,
@@ -432,144 +506,48 @@ def _estimate_vmem_bytes_v2(
     quant_block_k=128,
     direct_scaled_dot=True,
     enable_bt_scatter_overlap=True,
+    fixed_gather_banks=2,
+    enable_act_quant=False,
+    a2a_mode="expert",
     verbose=False,
 ):
-    local_num_tokens = num_tokens // ep_size
-    t_packing = 1  # bf16 activations
-    w_bytes = 1 if use_fp8 else 2
-    token_bytes = 2  # bf16
-    h_per_t = hidden_size // t_packing
-    padded_num_experts = _align_to(num_experts, 128)
-    padded_top_k = _align_to(top_k, 128)
-    acc_bt = math.gcd(bt, 16)
-    num_bt = local_num_tokens // bt if bt > 0 else 1
-    use_bt_scatter_bank = enable_bt_scatter_overlap and num_bt > 1
-    use_gather_bank = num_bt > 1
-    # fixed-K gather banks: metadata/topk use Km=K+1=3 (K=2 payload), so routing
-    # SMEM scales with min(num_bt, 3), not num_bt.
-    smem_banks = min(num_bt, 3) if use_gather_bank else 2
-
-    # Gather accumulation: (2, top_k, acc_bt, t_packing, h_per_t)
-    b_a2a_g_acc = 2 * top_k * acc_bt * hidden_size * token_bytes
-    # TopK weights: (smem_banks, bt, padded_top_k) f32
-    b_topk_w = smem_banks * bt * padded_top_k * 4
-    # TopK ids: (smem_banks, bt, padded_top_k) i32
-    b_topk_id = smem_banks * bt * padded_top_k * 4
-    # Output: (smem_banks, bt, hidden_size) t_dtype
-    b_output = smem_banks * bt * hidden_size * token_bytes
-
-    # Weight double buffers: (2, t_packing, h_per_t, bf) or (2, t_packing, bf, h_per_t)
-    b_w1 = 2 * hidden_size * bf * w_bytes
-    b_w3 = 2 * hidden_size * bf * w_bytes
-    b_w2 = 2 * bf * hidden_size * w_bytes
-
-    # Scale buffers (fp8 only)
-    b_w1_scale = 0
-    b_w3_scale = 0
-    b_w2_scale = 0
-    if use_fp8:
-        _n_sg = 1 if quant_block_k is None else h_per_t // quant_block_k
-        _n_sg2 = 1 if quant_block_k is None else bf // quant_block_k
-        b_w1_scale = 2 * t_packing * _n_sg * bf * 4
-        b_w3_scale = b_w1_scale
-        b_w2_scale = 2 * t_packing * _n_sg2 * h_per_t * 4
-
-    # Dequant scratch (fp8 + not direct_scaled_dot)
-    b_w1_dq = 0
-    b_w3_dq = 0
-    b_w2_dq = 0
-    if use_fp8 and not direct_scaled_dot:
-        b_w1_dq = t_packing * h_per_t * bf * 2  # bf16
-        b_w3_dq = b_w1_dq
-        b_w2_dq = t_packing * bf * h_per_t * 2  # bf16
-
-    # Gate/up accumulators: (bts, bf) f32 each
-    b_gate_acc = bts * bf * 4
-    b_up_acc = bts * bf * 4
-    # Token staging: (bts, t_packing, h_per_t) t_dtype
-    b_x = bts * hidden_size * token_bytes
-    # Output accumulator: (bts, t_packing, h_per_t) f32
-    b_y_acc = bts * hidden_size * 4
-    # Output staging: (bts, t_packing, h_per_t) t_dtype
-    b_y_stage = bts * hidden_size * token_bytes
-
-    # Kernel-scoped double-buffered metadata mailbox:
-    # (2, num_devices, 1, padded_num_experts) i32.
-    b_metadata_mailbox = 2 * ep_size * padded_num_experts * 4
-
-    # Scoped metadata temporaries (run_scoped, only one path active)
-    local_num_experts = num_experts // ep_size
-    b_scoped = (
-        bt * padded_top_k * 4  # t2e_routing
-        + 2 * padded_num_experts * 4  # expert_offsets
-        + padded_num_experts * 4  # expert_starts
-        + padded_num_experts * 4  # expert_sizes
+    del bse, intermediate_size
+    plan = build_fused_moe_v2_scratch_plan(
+        num_tokens=num_tokens,
+        num_experts=num_experts,
+        top_k=top_k,
+        hidden_size=hidden_size,
+        ep_size=ep_size,
+        bt=bt,
+        bf=bf,
+        bts=bts,
+        input_bytes=2,
+        enable_act_quant=enable_act_quant,
+        has_weight_scales=use_fp8,
+        quant_block_k=quant_block_k,
+        enable_bt_scatter_overlap=enable_bt_scatter_overlap,
+        fixed_gather_banks=fixed_gather_banks,
+        a2a_mode=a2a_mode,
     )
-
-    # Semaphore overhead (conservative flat estimate)
-    num_bt_banks = num_bt if use_gather_bank else (2 if use_bt_scatter_bank else 1)
-    b_sems = (
-        2 * 4  # x_stage + y_store (1 each)
-        + smem_banks * 10 * 4  # local_sems
-        + 3
-        * (
-            num_bt_banks * local_num_experts * 4
-            if (use_bt_scatter_bank or use_gather_bank)
-            else local_num_experts * 4
-        )
-        + (num_bt_banks * 4 if use_gather_bank else 4)  # a2a_gather
-        + 6 * 4  # a2a_acc + md_send[2] + md_recv[2] + barrier
-    )
-
-    total = (
-        b_a2a_g_acc
-        + b_topk_w
-        + b_topk_id
-        + b_output
-        + b_w1
-        + b_w3
-        + b_w2
-        + b_w1_scale
-        + b_w3_scale
-        + b_w2_scale
-        + b_w1_dq
-        + b_w3_dq
-        + b_w2_dq
-        + b_gate_acc
-        + b_up_acc
-        + b_x
-        + b_y_acc
-        + b_y_stage
-        + b_metadata_mailbox
-        + b_scoped
-        + b_sems
+    estimate = estimate_fused_moe_v2_vmem(
+        plan,
+        weight_bytes=1 if use_fp8 else 2,
+        direct_scaled_dot=direct_scaled_dot,
     )
 
     if verbose:
         mb = lambda b: f"{b / (1024 * 1024):.2f}"
         log(f"    VMEM Breakdown (bt={bt} bf={bf} btc={btc} bts={bts}):")
-        log(f"      a2a_g_acc:      {mb(b_a2a_g_acc)} MB  (2,{top_k},{acc_bt},{hidden_size})")
-        log(f"      topk_weights:   {mb(b_topk_w)} MB  ({smem_banks},{bt},{padded_top_k}) f32")
-        log(f"      topk_ids:       {mb(b_topk_id)} MB")
-        log(f"      output:         {mb(b_output)} MB  ({smem_banks},{bt},{hidden_size})")
-        log(f"      W1 x2:          {mb(b_w1)} MB  (2,{hidden_size},{bf})")
-        log(f"      W3 x2:          {mb(b_w3)} MB")
-        log(f"      W2 x2:          {mb(b_w2)} MB")
-        if use_fp8:
-            log(f"      W1/W3 scale:    {mb(b_w1_scale)} MB each")
-            log(f"      W2 scale:       {mb(b_w2_scale)} MB")
-        if b_w1_dq:
-            log(f"      W1/W3 dequant:  {mb(b_w1_dq)} MB each")
-            log(f"      W2 dequant:     {mb(b_w2_dq)} MB")
-        log(f"      gate+up acc:    {mb(b_gate_acc + b_up_acc)} MB  ({bts},{bf}) f32")
-        log(f"      x+y_acc+y_stg:  {mb(b_x + b_y_acc + b_y_stage)} MB")
+        for name, size in estimate.components:
+            log(f"      {name:<24} {mb(size)} MB")
+        log(f"      {'Logical total':<24} {mb(estimate.total_bytes)} MB")
         log(
-            f"      metadata mbox:  {mb(b_metadata_mailbox)} MB  (2,{ep_size},{padded_num_experts}) i32"
+            f"      {'Mosaic scoped overhead':<24} "
+            f"{mb(estimate.mosaic_scoped_overhead_bytes)} MB"
         )
-        log(f"      scoped+sems:    {mb(b_scoped + b_sems)} MB")
-        log(f"      Total:          {mb(total)} MB")
+        log(f"      {'Compiler budget':<24} {mb(estimate.compiler_budget_bytes)} MB")
 
-    return total
+    return estimate
 
 
 def generate_tune_candidates(
@@ -584,7 +562,10 @@ def generate_tune_candidates(
     quant_block_k=128,
     direct_scaled_dot=True,
     enable_bt_scatter_overlap=True,
-    vmem_budget=64 * 1024 * 1024,
+    fixed_gather_banks=2,
+    enable_act_quant=False,
+    a2a_mode="expert",
+    vmem_budget=FUSED_MOE_V2_VMEM_LIMIT_BYTES,
     vmem_headroom=0.95,
     max_configs=48,
     bse=256,
@@ -685,7 +666,7 @@ def generate_tune_candidates(
                             continue
                         seen.add(key)
 
-                        est = _estimate_vmem_bytes_v2(
+                        estimate = _estimate_vmem_v2(
                             bt=bc_eff.bt,
                             bf=bc_eff.bf,
                             btc=bc_eff.btc,
@@ -701,14 +682,17 @@ def generate_tune_candidates(
                             quant_block_k=quant_block_k,
                             direct_scaled_dot=direct_scaled_dot,
                             enable_bt_scatter_overlap=enable_bt_scatter_overlap,
+                            fixed_gather_banks=fixed_gather_banks,
+                            enable_act_quant=enable_act_quant,
+                            a2a_mode=a2a_mode,
                             verbose=verbose and first_verbose,
                         )
                         first_verbose = False
-                        if est > effective_budget:
+                        if estimate.compiler_budget_bytes > effective_budget:
                             log(
                                 f"  VMEM skip bt={bc_eff.bt},bf={bc_eff.bf},"
                                 f"btc={bc_eff.btc},bts={bc_eff.bts},bse={bc_eff.bse}: "
-                                f"{est / (1024 * 1024):.1f}MB > "
+                                f"{estimate.compiler_budget_bytes / (1024 * 1024):.1f}MB > "
                                 f"{effective_budget / (1024 * 1024):.1f}MB"
                             )
                             continue
@@ -974,10 +958,81 @@ log("weights ready")
 
 # --- Sweep ---
 results: list[tuple[int, str, float, list[float]]] = []
+runs_by_config: dict[tuple[int, str], dict[str, Any]] = {}
+invocations_by_config: dict[tuple[int, str], tuple[FusedMoEBlockConfig, str, bool]] = {}
+failure_records: list[dict[str, Any]] = []
 routing_metrics_by_tokens = {}
+routing_ids_by_tokens = {}
+
+
+def _common_evidence_fields(num_tokens: int) -> dict[str, Any]:
+    return {
+        "variant": benchmark_variant,
+        "run_id": benchmark_run_id,
+        "tokens": num_tokens,
+        "num_experts": E,
+        "top_k": top_k,
+        "hidden_size": d,
+        "intermediate_size": f,
+        "ep_size": ep_size,
+        "process_index": jax.process_index(),
+        "process_count": jax.process_count(),
+        "device_kind": device_kind,
+        "device_count": jax.device_count(),
+        "local_device_count": jax.local_device_count(),
+        "mesh_shape": {"data": 1, "tensor": num_devices},
+        "git_revision": git_revision,
+        "git_dirty": git_dirty,
+        "activation_dtype": "bfloat16",
+        "weight_dtype": "float8_e4m3fn" if use_fp8 else "bfloat16",
+        "quant_block_k": quant_block_k,
+        "use_shared_expert": use_shared_expert,
+        "shared_expert_intermediate_size": se_inter if use_shared_expert else 0,
+        "enable_act_quant": enable_act_quant,
+        "enable_bt_scatter_overlap": enable_bt_scatter_overlap,
+        "fixed_gather_banks": fixed_gather_banks,
+        "direct_scaled_dot": direct_scaled_dot,
+        "routing_mode": routing_mode,
+        "a2a_mode": a2a_mode,
+        "timing_method": timing_label,
+        "swiglu_limit": SWIGLU_LIMIT,
+        "shared_swiglu_limit": SHARED_SWIGLU_LIMIT,
+        "forward_mode": forward_mode_label,
+        "workload_regime": getattr(workload_regime, "value", workload_regime),
+    }
+
 
 for num_tokens in token_candidates:
     log(f"--- tokens={num_tokens} ---")
+
+    production_cfg = None
+    production_cfg_resolved = None
+    try:
+        production_cfg = get_tuned_fused_moe_v2_block_config(
+            num_tokens=num_tokens,
+            num_experts=E,
+            top_k=top_k,
+            hidden_size=d,
+            intermediate_size=f,
+            dtype=jnp.bfloat16,
+            weight_dtype=(jnp.float8_e4m3fn if use_fp8 else jnp.bfloat16),
+            ep_size=ep_size,
+            use_shared_expert=use_shared_expert,
+            use_grouped_topk=False,
+            enable_act_quant=enable_act_quant,
+            quant_mode=(
+                "none" if not use_fp8 else ("per_channel" if quant_block_k is None else "blockwise")
+            ),
+            workload_regime=workload_regime,
+        )
+        local_nt = num_tokens // ep_size
+        padded_nt = align_local_tokens_for_v2(local_nt) * ep_size
+        production_cfg_resolved = production_cfg.effective_for(
+            num_tokens=padded_nt,
+            ep_size=ep_size,
+        )
+    except Exception as e:
+        log(f"  production config lookup skipped ({e})")
 
     if tune_mode:
         local_nt = num_tokens // ep_size
@@ -993,6 +1048,9 @@ for num_tokens in token_candidates:
             quant_block_k=quant_block_k,
             direct_scaled_dot=direct_scaled_dot,
             enable_bt_scatter_overlap=enable_bt_scatter_overlap,
+            fixed_gather_banks=fixed_gather_banks,
+            enable_act_quant=enable_act_quant,
+            a2a_mode=a2a_mode,
             bse=bse,
             use_shared_expert=use_shared_expert,
             se_inter=se_inter,
@@ -1011,42 +1069,18 @@ for num_tokens in token_candidates:
                 bts_candidates,
             )
         ]
-        tuned_cfg = None
         if auto_tuned_block:
-            try:
-                tuned_cfg = get_tuned_fused_moe_v2_block_config(
-                    num_tokens=num_tokens,
-                    num_experts=E,
-                    top_k=top_k,
-                    hidden_size=d,
-                    intermediate_size=f,
-                    dtype=jnp.bfloat16,
-                    weight_dtype=(jnp.float8_e4m3fn if use_fp8 else jnp.bfloat16),
-                    ep_size=ep_size,
-                    use_shared_expert=use_shared_expert,
-                    use_grouped_topk=False,
-                    enable_act_quant=enable_act_quant,
-                    quant_mode=(
-                        "none"
-                        if not use_fp8
-                        else ("per_channel" if quant_block_k is None else "blockwise")
-                    ),
+            if production_cfg is None:
+                raise ValueError(
+                    "Production block-config lookup failed; explicitly set BENCH_BT/BF/BTC/BTS "
+                    "to run a non-production baseline."
                 )
-            except Exception as e:  # e.g. num_tokens not aligned to ep_size
-                log(f"  tuned lookup skipped ({e}); using defaults")
-                tuned_cfg = None
-        if tuned_cfg is not None and tuned_cfg is not DEFAULT_V2_BLOCK_CONFIG:
             log(
-                f"  tuned config HIT: bt={tuned_cfg.bt} bf={tuned_cfg.bf} "
-                f"btc={tuned_cfg.btc} bse={tuned_cfg.bse} bts={tuned_cfg.bts}"
+                f"  production config: bt={production_cfg.bt} bf={production_cfg.bf} "
+                f"btc={production_cfg.btc} bse={production_cfg.bse} bts={production_cfg.bts}"
             )
-            block_configs_to_try = [tuned_cfg]
+            block_configs_to_try = [production_cfg]
         else:
-            if auto_tuned_block:
-                log(
-                    f"  no tuned config for tokens={num_tokens}; falling back to defaults "
-                    f"bt={bt_candidates} bf={bf_candidates} btc={btc_candidates} bts={bts_candidates}"
-                )
             block_configs_to_try = _default_cfgs
 
     tokens = make_sharded(k1, (num_tokens, d), jnp.bfloat16)
@@ -1067,6 +1101,7 @@ for num_tokens in token_candidates:
         host_topk_ids = None
 
     if host_topk_ids is not None:
+        routing_ids_by_tokens[num_tokens] = host_topk_ids
         routing_metrics = calculate_rank_routing_metrics(
             host_topk_ids,
             num_experts=E,
@@ -1093,6 +1128,7 @@ for num_tokens in token_candidates:
         for bc_raw in block_configs_to_try
         for flags in itertools.product(
             cross_expert_prefetch_modes,
+            tail_aware_btc_values,
         )
     ]
     seen_resolved_configs = set()
@@ -1100,11 +1136,13 @@ for num_tokens in token_candidates:
     for (
         bc,
         xprefetch_mode,
+        tail_aware_btc,
     ) in configs_to_try:
         bt, bf, btc, bts = bc.bt, bc.bf, bc.btc, bc.bts
         tag = (
             f"bt={bt},bf={bf},btc={btc},bts={bts},bse={bc.bse},"
             f"xprefetch={xprefetch_mode},"
+            f"tail_btc={int(tail_aware_btc)},"
             f"direct={int(direct_scaled_dot)}"
         )
 
@@ -1119,12 +1157,33 @@ for num_tokens in token_candidates:
             bc_resolved = bc.effective_for(num_tokens=padded_nt, ep_size=ep_size)
         except ValueError as e:
             log(f"  SKIP {tag}: {e}")
+            failure_records.append(
+                {
+                    **_common_evidence_fields(num_tokens),
+                    "block_config": tag,
+                    "requested_block_config": {
+                        "bt": bc.bt,
+                        "bf": bc.bf,
+                        "btc": bc.btc,
+                        "bts": bc.bts,
+                        "bse": bc.bse,
+                    },
+                    "resolved_block_config": None,
+                    "execution_status": "config_rejected",
+                    "failure_stage": "config_resolution",
+                    "error_type": type(e).__name__,
+                    "error_message": str(e),
+                    "correctness_status": "not_run",
+                    "samples_ms": [],
+                }
+            )
             continue
 
         tag_resolved = (
             f"bt={bc_resolved.bt},bf={bc_resolved.bf},"
             f"btc={bc_resolved.btc},bts={bc_resolved.bts},bse={bc_resolved.bse},"
             f"xprefetch={xprefetch_mode},"
+            f"tail_btc={int(tail_aware_btc)},"
             f"direct={int(direct_scaled_dot)}"
         )
         resolved_key = (
@@ -1134,12 +1193,96 @@ for num_tokens in token_candidates:
             bc_resolved.bts,
             bc_resolved.bse,
             xprefetch_mode,
+            tail_aware_btc,
             direct_scaled_dot,
         )
         if resolved_key in seen_resolved_configs:
             log(f"  SKIP duplicate resolved config {tag} -> {tag_resolved}")
             continue
         seen_resolved_configs.add(resolved_key)
+
+        vmem_estimate = _estimate_vmem_v2(
+            bt=bc_resolved.bt,
+            bf=bc_resolved.bf,
+            btc=bc_resolved.btc,
+            bse=bc_resolved.bse,
+            bts=bc_resolved.bts,
+            hidden_size=d,
+            intermediate_size=f,
+            num_experts=E,
+            top_k=top_k,
+            ep_size=ep_size,
+            num_tokens=padded_nt,
+            use_fp8=use_fp8,
+            quant_block_k=quant_block_k,
+            direct_scaled_dot=direct_scaled_dot,
+            enable_bt_scatter_overlap=enable_bt_scatter_overlap,
+            fixed_gather_banks=fixed_gather_banks,
+            enable_act_quant=enable_act_quant,
+            a2a_mode=a2a_mode,
+        )
+        runs_by_config[(num_tokens, tag_resolved)] = {
+            "resolved_block_config": {
+                "bt": bc_resolved.bt,
+                "bf": bc_resolved.bf,
+                "btc": bc_resolved.btc,
+                "bts": bc_resolved.bts,
+                "bse": bc_resolved.bse,
+            },
+            "cross_expert_prefetch_mode": xprefetch_mode,
+            "tail_aware_btc": tail_aware_btc,
+            "config_source": (
+                "tune_candidate"
+                if tune_mode
+                else ("production_lookup" if auto_tuned_block else "explicit")
+            ),
+            "production_resolved_block_config": (
+                None
+                if production_cfg_resolved is None
+                else {
+                    "bt": production_cfg_resolved.bt,
+                    "bf": production_cfg_resolved.bf,
+                    "btc": production_cfg_resolved.btc,
+                    "bts": production_cfg_resolved.bts,
+                    "bse": production_cfg_resolved.bse,
+                }
+            ),
+            "matches_production_block_config": (
+                _block_config_signature(bc_resolved)
+                == _block_config_signature(production_cfg_resolved)
+            ),
+            "logical_vmem_bytes": vmem_estimate.total_bytes,
+            "estimated_vmem_bytes": vmem_estimate.compiler_budget_bytes,
+            "vmem_limit_bytes": FUSED_MOE_V2_VMEM_LIMIT_BYTES,
+            "vmem_headroom_bytes": (
+                FUSED_MOE_V2_VMEM_LIMIT_BYTES - vmem_estimate.compiler_budget_bytes
+            ),
+            "vmem_estimate_scope": "logical_plus_calibrated_mosaic_scoped_working_set",
+        }
+        try:
+            validate_fused_moe_v2_vmem_budget(vmem_estimate)
+        except ValueError as e:
+            log(f"  VMEM SKIP {tag_resolved}: {e}")
+            failure_records.append(
+                {
+                    **_common_evidence_fields(num_tokens),
+                    "block_config": tag_resolved,
+                    **runs_by_config[(num_tokens, tag_resolved)],
+                    "execution_status": "config_rejected",
+                    "failure_stage": "vmem_preflight",
+                    "error_type": type(e).__name__,
+                    "error_message": str(e),
+                    "correctness_status": "not_run",
+                    "samples_ms": [],
+                }
+            )
+            continue
+
+        invocations_by_config[(num_tokens, tag_resolved)] = (
+            bc,
+            xprefetch_mode,
+            tail_aware_btc,
+        )
 
         def run_fn():
             return fused_ep_moe_v2(
@@ -1167,6 +1310,7 @@ for num_tokens in token_candidates:
                 direct_scaled_dot=direct_scaled_dot,
                 enable_act_quant=enable_act_quant,
                 cross_expert_prefetch_mode=xprefetch_mode,
+                tail_aware_btc=tail_aware_btc,
                 fixed_gather_banks=fixed_gather_banks,
                 enable_bt_scatter_overlap=enable_bt_scatter_overlap,
                 a2a_mode=a2a_mode,
@@ -1202,11 +1346,45 @@ for num_tokens in token_candidates:
                     results.append((num_tokens, tag_resolved, avg, times))
                 else:
                     log(f"  {tag_resolved}: no timing data")
+                    failure_records.append(
+                        {
+                            **_common_evidence_fields(num_tokens),
+                            "block_config": tag_resolved,
+                            **runs_by_config[(num_tokens, tag_resolved)],
+                            "execution_status": "no_timing_data",
+                            "failure_stage": "timing",
+                            "error_type": None,
+                            "error_message": "Timing completed without device samples.",
+                            "correctness_status": "not_run",
+                            "samples_ms": [],
+                        }
+                    )
         except Exception as e:
             log(f"  FAIL {tag}: {e}")
+            failure_records.append(
+                {
+                    **_common_evidence_fields(num_tokens),
+                    "block_config": tag_resolved,
+                    **runs_by_config[(num_tokens, tag_resolved)],
+                    "execution_status": "failed",
+                    "failure_stage": "compile_or_execute",
+                    "error_type": type(e).__name__,
+                    "error_message": str(e),
+                    "correctness_status": "not_run",
+                    "samples_ms": [],
+                }
+            )
             continue
 
 # --- Summary ---
+metrics_path = pathlib.Path(metrics_jsonl) if metrics_jsonl else None
+if metrics_path is not None and jax.process_index() == 0 and failure_records:
+    metrics_path.parent.mkdir(parents=True, exist_ok=True)
+    with metrics_path.open("w", encoding="utf-8") as fh:
+        for record in failure_records:
+            fh.write(json.dumps(record, sort_keys=True) + "\n")
+    log(f"wrote {len(failure_records)} failed/rejected candidates to {metrics_path}")
+
 if not results:
     raise RuntimeError(
         "No fused MoE v2 configurations produced valid timings. "
@@ -1220,132 +1398,251 @@ if results:
     for nt, tag, avg, times in results:
         by_tokens.setdefault(nt, []).append((tag, avg, times))
     for nt in sorted(by_tokens.keys()):
-        entries = sorted(by_tokens[nt], key=lambda x: x[1])
+        entries = sorted(by_tokens[nt], key=lambda x: float(np.median(x[2])))
         best_tag, best_avg, best_times = entries[0]
-        log(f"  tokens={nt}: best={best_avg:.3f}ms [{best_tag}]")
+        best_p50 = float(np.median(best_times))
+        log(f"  tokens={nt}: best_p50={best_p50:.3f}ms avg={best_avg:.3f}ms [{best_tag}]")
         if len(entries) > 1:
-            for tag, avg, _ in entries[1:]:
-                log(f"    {avg:.3f}ms [{tag}]")
+            for tag, avg, times in entries[1:]:
+                log(f"    p50={np.median(times):.3f}ms avg={avg:.3f}ms [{tag}]")
 
-    if metrics_jsonl:
-        metrics_path = pathlib.Path(metrics_jsonl)
+    if metrics_path is not None and jax.process_index() == 0:
         metrics_path.parent.mkdir(parents=True, exist_ok=True)
-        with metrics_path.open("w", encoding="utf-8") as fh:
+        write_mode = "a" if failure_records else "w"
+        with metrics_path.open(write_mode, encoding="utf-8") as fh:
             for nt in sorted(by_tokens):
-                entries = sorted(by_tokens[nt], key=lambda x: x[1])
-                best_avg = entries[0][1]
+                entries = sorted(by_tokens[nt], key=lambda x: float(np.median(x[2])))
+                best_p50 = float(np.median(entries[0][2]))
                 for tag, avg, times in entries:
+                    run_metadata = runs_by_config[(nt, tag)]
+                    p50 = float(np.median(times))
                     record = {
-                        "variant": benchmark_variant,
-                        "tokens": nt,
-                        "num_experts": E,
-                        "top_k": top_k,
-                        "hidden_size": d,
-                        "intermediate_size": f,
-                        "ep_size": ep_size,
-                        "process_index": jax.process_index(),
-                        "activation_dtype": "bfloat16",
-                        "weight_dtype": "float8_e4m3fn" if use_fp8 else "bfloat16",
-                        "quant_block_k": quant_block_k,
-                        "use_shared_expert": use_shared_expert,
-                        "shared_expert_intermediate_size": se_inter if use_shared_expert else 0,
-                        "enable_act_quant": enable_act_quant,
-                        "enable_bt_scatter_overlap": enable_bt_scatter_overlap,
-                        "routing_mode": routing_mode,
-                        "a2a_mode": a2a_mode,
+                        **_common_evidence_fields(nt),
                         "block_config": tag,
+                        **run_metadata,
+                        "execution_status": "success",
+                        "correctness_status": "not_checked_per_config",
                         "latency_ms": float(avg),
-                        "latency_p50_ms": float(np.median(times)),
+                        "latency_p50_ms": p50,
+                        "latency_p95_ms": float(np.percentile(times, 95)),
                         "latency_min_ms": float(np.min(times)),
+                        "latency_std_ms": float(np.std(times)),
                         "samples_ms": [float(t) for t in times],
-                        "is_best_for_tokens": bool(avg == best_avg),
+                        "is_best_for_tokens": bool(p50 == best_p50),
                     }
                     routing_metrics = routing_metrics_by_tokens.get(nt)
                     if routing_metrics is not None:
-                        record["routing_metrics"] = routing_metrics.as_dict()
+                        routing_record = routing_metrics.as_dict()
+                        bt_match = re.search(r"(?:^|,)bt=(\d+)", tag)
+                        if bt_match is not None:
+                            resolved = run_metadata["resolved_block_config"]
+                            btc_work = calculate_expert_btc_work(
+                                routing_ids_by_tokens[nt],
+                                num_experts=E,
+                                ep_size=ep_size,
+                                source_ranks=infer_contiguous_source_ranks(nt, ep_size),
+                                local_block_tokens=int(bt_match.group(1)),
+                                bts=int(resolved["bts"]),
+                                btc=int(resolved["btc"]),
+                            )
+                            packed_launches, packed_remote_launches = (
+                                calculate_packed_rank_dispatch_launches(
+                                    routing_ids_by_tokens[nt],
+                                    num_experts=E,
+                                    ep_size=ep_size,
+                                    source_ranks=infer_contiguous_source_ranks(nt, ep_size),
+                                    local_block_tokens=int(bt_match.group(1)),
+                                )
+                            )
+                            (
+                                broadcast_launches,
+                                broadcast_remote_launches,
+                                broadcast_rows,
+                                broadcast_remote_rows,
+                            ) = calculate_rank_broadcast_traffic(
+                                routing_ids_by_tokens[nt],
+                                num_experts=E,
+                                ep_size=ep_size,
+                                source_ranks=infer_contiguous_source_ranks(nt, ep_size),
+                                local_block_tokens=int(bt_match.group(1)),
+                            )
+                            gather_launches, gather_remote_launches = (
+                                calculate_expert_gather_launches(
+                                    routing_ids_by_tokens[nt],
+                                    num_experts=E,
+                                    ep_size=ep_size,
+                                    source_ranks=infer_contiguous_source_ranks(nt, ep_size),
+                                    local_block_tokens=int(bt_match.group(1)),
+                                )
+                            )
+                            routing_record.update(
+                                {
+                                    **btc_work.as_dict(),
+                                    "modeled_current_v2_dispatch_dma_launches": (
+                                        routing_metrics.valid_expert_routes
+                                    ),
+                                    "modeled_current_v2_remote_dispatch_dma_launches": (
+                                        routing_metrics.remote_expert_routes
+                                    ),
+                                    "modeled_unpacked_rank_dispatch_dma_launches": (
+                                        routing_metrics.unique_rank_routes
+                                    ),
+                                    "modeled_unpacked_remote_rank_dispatch_dma_launches": (
+                                        routing_metrics.unique_remote_rank_routes
+                                    ),
+                                    "modeled_packed_rank_dispatch_dma_launches": packed_launches,
+                                    "modeled_packed_remote_rank_dispatch_dma_launches": (
+                                        packed_remote_launches
+                                    ),
+                                    "modeled_rank_broadcast_dma_launches": (broadcast_launches),
+                                    "modeled_remote_rank_broadcast_dma_launches": (
+                                        broadcast_remote_launches
+                                    ),
+                                    "modeled_rank_broadcast_activation_rows": (broadcast_rows),
+                                    "modeled_remote_rank_broadcast_activation_rows": (
+                                        broadcast_remote_rows
+                                    ),
+                                    "modeled_current_v2_return_dma_launches": gather_launches,
+                                    "modeled_current_v2_remote_return_dma_launches": (
+                                        gather_remote_launches
+                                    ),
+                                    "modeled_packed_rank_combine_return_dma_launches": (
+                                        packed_launches
+                                    ),
+                                    "modeled_packed_remote_rank_combine_return_dma_launches": (
+                                        packed_remote_launches
+                                    ),
+                                    "dma_launch_measurement_scope": (
+                                        "algorithmic_model_not_hardware_counter"
+                                    ),
+                                }
+                            )
+                        record["routing_metrics"] = routing_record
                     fh.write(json.dumps(record, sort_keys=True) + "\n")
         log(f"wrote structured metrics to {metrics_path}")
 
-# --- Correctness check (optional, single-host only) ---
+missing_token_buckets = sorted(set(token_candidates) - set(by_tokens))
+if missing_token_buckets:
+    raise RuntimeError(
+        "No fused MoE v2 configuration produced a valid timing for requested "
+        f"token buckets {missing_token_buckets}. See the failure evidence above."
+    )
+
+# --- Correctness check (optional, winning measured config per token count) ---
 if check_correctness:
     if jax.process_count() > 1:
-        log("SKIP correctness check in multi-host mode (use single-host ep=8)")
+        log("SKIP correctness check in multi-host mode (use a single-host TPU slice)")
     else:
-        log("computing reference...")
-        bc0 = FusedMoEBlockConfig(
-            bt=bt_candidates[0],
-            bf=bf_candidates[0],
-            btc=btc_candidates[0],
-            bse=bse,
-            bts=bts_candidates[0],
-        )
-        nt0 = token_candidates[0]
-        tokens_c = make_sharded(k1, (nt0, d), jnp.bfloat16)
-        twts, tidx = make_topk_for_routing_mode(nt0)
-
-        result = fused_ep_moe_v2(
-            mesh,
-            tokens_c,
-            w1,
-            w2,
-            w3,
-            twts,
-            tidx,
-            top_k,
-            block_config=bc0,
-            swiglu_limit=SWIGLU_LIMIT,
-            shared_swiglu_limit=SHARED_SWIGLU_LIMIT,
-            quant_block_k=qbk_arg,
-            w1_scale=w1_scale_s,
-            w2_scale=w2_scale_s,
-            w3_scale=w3_scale_s,
-            w1_shared=w1_shared,
-            w2_shared=w2_shared,
-            w3_shared=w3_shared,
-            w1_shared_scale=w1_shared_scale,
-            w2_shared_scale=w2_shared_scale,
-            w3_shared_scale=w3_shared_scale,
-            direct_scaled_dot=direct_scaled_dot,
-            enable_act_quant=enable_act_quant,
-            fixed_gather_banks=fixed_gather_banks,
-            enable_bt_scatter_overlap=enable_bt_scatter_overlap,
-            a2a_mode=a2a_mode,
-        )
-        ref_kwargs = {"swiglu_limit": SWIGLU_LIMIT, "shared_swiglu_limit": SHARED_SWIGLU_LIMIT}
-        if use_fp8:
-            ref_kwargs["quant_block_k"] = quant_block_k
-            ref_kwargs["w1_scale"] = jax.device_get(w1_scale_s)
-            ref_kwargs["w2_scale"] = jax.device_get(w2_scale_s)
-            ref_kwargs["w3_scale"] = jax.device_get(w3_scale_s)
-        if use_shared_expert:
-            ref_kwargs["w1_shared"] = jax.device_get(w1_shared)
-            ref_kwargs["w2_shared"] = jax.device_get(w2_shared)
-            ref_kwargs["w3_shared"] = jax.device_get(w3_shared)
-            if w1_shared_scale is not None:
-                ref_kwargs["w1_shared_scale"] = jax.device_get(w1_shared_scale)
-                ref_kwargs["w2_shared_scale"] = jax.device_get(w2_shared_scale)
-                ref_kwargs["w3_shared_scale"] = jax.device_get(w3_shared_scale)
-        ref = ref_moe(
-            jax.device_get(tokens_c),
-            jax.device_get(w1),
-            jax.device_get(w2),
-            jax.device_get(w3),
-            jax.device_get(twts),
-            jax.device_get(tidx),
-            top_k,
-            **ref_kwargs,
-        )
-        result_f32 = jax.device_get(
-            jax.device_put(result, jax.sharding.NamedSharding(mesh, P()))
-        ).astype(np.float32)
-        ref_f32 = np.asarray(ref).astype(np.float32)
-        max_err = np.max(np.abs(result_f32 - ref_f32))
-        rel_err = float(max_err / (np.max(np.abs(ref_f32)) + 1e-6))
-        log(f"max_abs_err={max_err:.4f}, rel_err={rel_err:.6f}")
         bench_tol = float(os.environ.get("BENCH_TOL", "0.05"))
-        if rel_err > bench_tol:
-            log("FAIL: relative error too high")
-            sys.exit(1)
-        log("PASS")
+        correctness_records = []
+        correctness_failed = False
+        for nt0 in sorted(by_tokens):
+            best_tag = min(by_tokens[nt0], key=lambda entry: float(np.median(entry[2])))[0]
+            bc0, xprefetch_mode, tail_aware_btc = invocations_by_config[(nt0, best_tag)]
+            log(f"checking winning config for tokens={nt0}: {best_tag}")
+            try:
+                tokens_c = make_sharded(k1, (nt0, d), jnp.bfloat16)
+                twts, tidx = make_topk_for_routing_mode(nt0)
+                result = fused_ep_moe_v2(
+                    mesh,
+                    tokens_c,
+                    w1,
+                    w2,
+                    w3,
+                    twts,
+                    tidx,
+                    top_k,
+                    block_config=bc0,
+                    swiglu_limit=SWIGLU_LIMIT,
+                    shared_swiglu_limit=SHARED_SWIGLU_LIMIT,
+                    quant_block_k=qbk_arg,
+                    w1_scale=w1_scale_s,
+                    w2_scale=w2_scale_s,
+                    w3_scale=w3_scale_s,
+                    w1_shared=w1_shared,
+                    w2_shared=w2_shared,
+                    w3_shared=w3_shared,
+                    w1_shared_scale=w1_shared_scale,
+                    w2_shared_scale=w2_shared_scale,
+                    w3_shared_scale=w3_shared_scale,
+                    direct_scaled_dot=direct_scaled_dot,
+                    enable_act_quant=enable_act_quant,
+                    cross_expert_prefetch_mode=xprefetch_mode,
+                    tail_aware_btc=tail_aware_btc,
+                    fixed_gather_banks=fixed_gather_banks,
+                    enable_bt_scatter_overlap=enable_bt_scatter_overlap,
+                    a2a_mode=a2a_mode,
+                )
+                ref_kwargs = {
+                    "swiglu_limit": SWIGLU_LIMIT,
+                    "shared_swiglu_limit": SHARED_SWIGLU_LIMIT,
+                }
+                if use_fp8:
+                    ref_kwargs["quant_block_k"] = quant_block_k
+                    ref_kwargs["w1_scale"] = jax.device_get(w1_scale_s)
+                    ref_kwargs["w2_scale"] = jax.device_get(w2_scale_s)
+                    ref_kwargs["w3_scale"] = jax.device_get(w3_scale_s)
+                if use_shared_expert:
+                    ref_kwargs["w1_shared"] = jax.device_get(w1_shared)
+                    ref_kwargs["w2_shared"] = jax.device_get(w2_shared)
+                    ref_kwargs["w3_shared"] = jax.device_get(w3_shared)
+                    if w1_shared_scale is not None:
+                        ref_kwargs["w1_shared_scale"] = jax.device_get(w1_shared_scale)
+                        ref_kwargs["w2_shared_scale"] = jax.device_get(w2_shared_scale)
+                        ref_kwargs["w3_shared_scale"] = jax.device_get(w3_shared_scale)
+                ref = ref_moe(
+                    jax.device_get(tokens_c),
+                    jax.device_get(w1),
+                    jax.device_get(w2),
+                    jax.device_get(w3),
+                    jax.device_get(twts),
+                    jax.device_get(tidx),
+                    top_k,
+                    **ref_kwargs,
+                )
+                result_f32 = jax.device_get(
+                    jax.device_put(result, jax.sharding.NamedSharding(mesh, P()))
+                ).astype(np.float32)
+                ref_f32 = np.asarray(ref).astype(np.float32)
+                max_err = float(np.max(np.abs(result_f32 - ref_f32)))
+                rel_err = float(max_err / (np.max(np.abs(ref_f32)) + 1e-6))
+                correctness_status = "passed" if rel_err <= bench_tol else "failed"
+                error_type = None
+                error_message = None
+                log(
+                    f"  {correctness_status.upper()}: max_abs_err={max_err:.4f}, "
+                    f"rel_err={rel_err:.6f}, tolerance={bench_tol:.6f}"
+                )
+            except Exception as e:
+                max_err = rel_err = None
+                correctness_status = "failed"
+                error_type = type(e).__name__
+                error_message = str(e)
+                log(f"  FAIL correctness execution: {e}")
+
+            correctness_failed |= correctness_status == "failed"
+            correctness_records.append(
+                {
+                    **_common_evidence_fields(nt0),
+                    "block_config": best_tag,
+                    **runs_by_config[(nt0, best_tag)],
+                    "execution_status": "correctness_only",
+                    "correctness_status": correctness_status,
+                    "correctness_tolerance": bench_tol,
+                    "max_abs_error": max_err,
+                    "max_relative_error": rel_err,
+                    "error_type": error_type,
+                    "error_message": error_message,
+                    "samples_ms": [],
+                }
+            )
+
+        if metrics_path is not None and jax.process_index() == 0:
+            with metrics_path.open("a", encoding="utf-8") as fh:
+                for record in correctness_records:
+                    fh.write(json.dumps(record, sort_keys=True) + "\n")
+            log(f"appended {len(correctness_records)} correctness records to {metrics_path}")
+        if correctness_failed:
+            raise RuntimeError("At least one winning configuration failed correctness.")
 
 log("done")

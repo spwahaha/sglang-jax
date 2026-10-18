@@ -8,6 +8,7 @@ Same lookup approach as v1/tuned_block_configs.py but with v2's simpler
 
 from __future__ import annotations
 
+import enum
 import logging
 
 import jax.numpy as jnp
@@ -17,6 +18,40 @@ from sgl_jax.srt.utils.jax_utils import get_device_name
 from .kernel import FusedMoEBlockConfig
 
 logger = logging.getLogger(__name__)
+
+
+class MoeWorkloadRegime(str, enum.Enum):
+    """Static, hashable hint distinguishing decode-shaped (latency-sensitive,
+    small batch) calls from prefill-shaped (throughput-sensitive, large batch)
+    calls, so the v2 tuned block-config lookup can pick different tile configs
+    for the same (num_tokens, ...) key.
+
+    AUTO is the default and reproduces the pre-existing regime-agnostic lookup
+    exactly: passing no regime, or AUTO explicitly, must select the same
+    FusedMoEBlockConfig as before this enum existed.
+    """
+
+    AUTO = "auto"
+    LATENCY = "latency"
+    THROUGHPUT = "throughput"
+
+
+_VALID_REGIMES = frozenset(MoeWorkloadRegime)
+
+
+def _coerce_regime(regime: MoeWorkloadRegime | str | None) -> MoeWorkloadRegime:
+    if regime is None:
+        return MoeWorkloadRegime.AUTO
+    if isinstance(regime, MoeWorkloadRegime):
+        return regime
+    try:
+        return MoeWorkloadRegime(regime)
+    except ValueError as e:
+        raise ValueError(
+            f"Unknown MoeWorkloadRegime {regime!r}; expected one of "
+            f"{sorted(r.value for r in _VALID_REGIMES)}"
+        ) from e
+
 
 # Key (without device_name):
 #   (tokens_dtype, weight_dtype, num_tokens, num_experts, top_k,
@@ -106,6 +141,19 @@ TUNED_BLOCK_CONFIGS: dict[str, dict[tuple, tuple[int, ...]]] = {
 }
 # fmt: on
 
+# Regime-specific overrides, keyed by MoeWorkloadRegime then device_name then the
+# same table_key/table_key_quant/table_key_legacy shapes as TUNED_BLOCK_CONFIGS.
+# Only consulted when the caller passes a non-AUTO regime; AUTO/None never reads
+# this table, so existing callers are unaffected regardless of its contents.
+#
+# Entries are installed only after clean, repeated TPU qualification against
+# the exact production-resolved baseline. Keep each workload regime separate:
+# a latency winner is not evidence for throughput.
+REGIME_TUNED_BLOCK_CONFIGS: dict[str, dict[str, dict[tuple, tuple[int, ...]]]] = {
+    MoeWorkloadRegime.LATENCY.value: {},
+    MoeWorkloadRegime.THROUGHPUT.value: {},
+}
+
 DEFAULT_V2_BLOCK_CONFIG = FusedMoEBlockConfig(
     bt=32,
     bf=512,
@@ -182,7 +230,9 @@ def get_tuned_fused_moe_v2_block_config(
     use_grouped_topk: bool = False,
     enable_act_quant: bool = False,
     quant_mode: str | None = None,
+    workload_regime: MoeWorkloadRegime | str | None = None,
 ) -> FusedMoEBlockConfig:
+    regime = _coerce_regime(workload_regime)
     keys = get_simplified_key(
         dtype=dtype,
         weight_dtype=weight_dtype,
@@ -212,7 +262,24 @@ def get_tuned_fused_moe_v2_block_config(
             cfg = TUNED_BLOCK_CONFIGS.get("*", {}).get(k)
         return cfg
 
-    cfg_tuple = _lookup(table_key_quant)
+    cfg_tuple = None
+    if regime is not MoeWorkloadRegime.AUTO:
+        device_tables = REGIME_TUNED_BLOCK_CONFIGS.get(regime.value, {})
+
+        def _lookup_regime(k):
+            cfg = device_tables.get(device_name, {}).get(k)
+            if cfg is None:
+                cfg = device_tables.get("*", {}).get(k)
+            return cfg
+
+        cfg_tuple = _lookup_regime(table_key_quant)
+        if cfg_tuple is None:
+            cfg_tuple = _lookup_regime(table_key)
+        if cfg_tuple is None:
+            cfg_tuple = _lookup_regime(table_key_legacy)
+
+    if cfg_tuple is None:
+        cfg_tuple = _lookup(table_key_quant)
     if cfg_tuple is None:
         cfg_tuple = _lookup(table_key)
     if cfg_tuple is None:
@@ -226,7 +293,8 @@ def get_tuned_fused_moe_v2_block_config(
 
     bt, bf, btc, bse, bts = cfg_tuple
     logger.info(
-        "Using v2 tuned block config: num_tokens=%d bt=%d bf=%d btc=%d bse=%d bts=%s",
+        "Using v2 tuned block config: regime=%s num_tokens=%d bt=%d bf=%d btc=%d bse=%d bts=%s",
+        regime.value,
         num_tokens,
         bt,
         bf,

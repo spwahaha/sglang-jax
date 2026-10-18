@@ -226,6 +226,7 @@ class ServerArgs:
     gdn_prefill_impl: str = "fused_chunk_parallel"
     dsa_use_pallas: bool = True  # deprecated no-op; jnp-ref e2e path removed
     moe_backend: str = "epmoe"
+    fused_moe_a2a_mode: str = "expert"
     disable_jax_allreduce_metadata: bool = False
     enable_topk_kernel: bool = True
 
@@ -1564,6 +1565,23 @@ class ServerArgs:
             default=ServerArgs.moe_backend,
             help="The backend to use for MoE models.",
         )
+        parser.add_argument(
+            "--fused-moe-a2a-mode",
+            type=str,
+            choices=[
+                "expert",
+                "rank_direct",
+                "rank_broadcast",
+                "rank_dispatch",
+                "rank_dispatch_combine",
+            ],
+            default=ServerArgs.fused_moe_a2a_mode,
+            help=(
+                "Experimental fused_v2 MoE communication protocol. "
+                "The default 'expert' preserves production behavior; other modes "
+                "are intended for controlled qualification only."
+            ),
+        )
 
         parser.add_argument(
             "--disable-jax-allreduce-metadata",
@@ -2085,6 +2103,12 @@ class ServerArgs:
 
         if self.moe_dp_size < 1:
             raise ValueError("--moe-dp-size must be at least 1")
+
+        if self.fused_moe_a2a_mode != "expert" and self.moe_backend != "fused_v2":
+            raise ValueError(
+                "--fused-moe-a2a-mode requires --moe-backend fused_v2 when set "
+                "to a non-default mode"
+            )
 
         # moe_dp_size=1 is the compatibility path and deliberately keeps all
         # existing recipes under their previous EP/TP validation rules.

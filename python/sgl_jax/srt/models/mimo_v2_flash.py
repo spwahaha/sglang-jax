@@ -12,7 +12,11 @@ from transformers import PretrainedConfig
 
 from sgl_jax.srt.configs.model_config import ModelConfig
 from sgl_jax.srt.layers.embeddings import Embed, ParallelLMHead, get_rope
-from sgl_jax.srt.layers.fused_moe import FusedEPMoE, FusedEPMoEV2
+from sgl_jax.srt.layers.fused_moe import (
+    FusedEPMoE,
+    FusedEPMoEV2,
+    fused_moe_workload_regime_from_forward_mode,
+)
 from sgl_jax.srt.layers.layernorm import RMSNorm
 from sgl_jax.srt.layers.linear import LinearBase
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
@@ -128,6 +132,7 @@ class MiMoV2Moe(nnx.Module):
                 layer_id=layer_id,
                 renormalize_topk_logits=getattr(config, "norm_topk_prob", True),
                 quantization_config=getattr(config, "quantization_config", None),
+                fused_moe_a2a_mode=getattr(config, "fused_moe_a2a_mode", "expert"),
             )
         elif self.use_fused:
             self.experts = FusedEPMoE(
@@ -185,6 +190,15 @@ class MiMoV2Moe(nnx.Module):
                 topk_weights,
                 topk_ids,
                 out_sharding=out_sharding,
+                **(
+                    {
+                        "workload_regime": fused_moe_workload_regime_from_forward_mode(
+                            forward_batch.forward_mode
+                        )
+                    }
+                    if isinstance(self.experts, FusedEPMoEV2)
+                    else {}
+                ),
             )
         else:
             mlp_output = self.experts(

@@ -600,6 +600,7 @@ class ModelRunner(ModelRunnerKVCacheMixin, BaseModelRunner):
             self.server_args.ep_num_redundant_experts
         )
         self.model_config.hf_config.moe_backend = self.model_config.moe_backend.value
+        self.model_config.hf_config.fused_moe_a2a_mode = self.server_args.fused_moe_a2a_mode
         self.model_config.hf_config.use_jax_allreduce_metadata = (
             not self.server_args.disable_jax_allreduce_metadata
         )

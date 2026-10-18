@@ -7,10 +7,15 @@ import unittest
 import numpy as np
 
 from sgl_jax.tools.moe_rank_routing import (
+    calculate_expert_btc_work,
+    calculate_expert_gather_launches,
+    calculate_packed_rank_dispatch_launches,
+    calculate_rank_broadcast_traffic,
     calculate_rank_routing_metrics,
     generate_cpu_baseline_records,
     infer_contiguous_source_ranks,
     make_controlled_topk,
+    payload_bandwidth_time_ms,
     reference_rank_combine,
     reference_rank_pack,
 )
@@ -165,12 +170,124 @@ class RankRoutingReferenceTest(unittest.TestCase):
         self.assertAlmostEqual(metrics.remote_dispatch_payload_reduction_ratio, 0.5)
 
         evidence = metrics.as_dict()
-        self.assertEqual(evidence["current_v2_dispatch_activation_copies"], 32)
-        self.assertEqual(evidence["candidate_rank_dispatch_activation_copies"], 16)
-        self.assertEqual(evidence["current_v2_return_activation_copies"], 32)
-        self.assertEqual(evidence["candidate_rank_combine_return_activation_copies"], 16)
-        self.assertEqual(evidence["current_v2_remote_dispatch_activation_copies"], 24)
-        self.assertEqual(evidence["candidate_remote_rank_dispatch_activation_copies"], 12)
+        self.assertEqual(evidence["logical_current_v2_dispatch_activation_rows"], 32)
+        self.assertEqual(evidence["logical_rank_dispatch_activation_rows"], 16)
+        self.assertEqual(evidence["logical_current_v2_return_activation_rows"], 32)
+        self.assertEqual(evidence["logical_rank_combine_return_activation_rows"], 16)
+        self.assertEqual(evidence["prototype_rank_combine_return_fp32_bytes"], 16 * 1024 * 4)
+        self.assertEqual(evidence["logical_current_v2_remote_dispatch_activation_rows"], 24)
+        self.assertEqual(evidence["logical_remote_rank_dispatch_activation_rows"], 12)
+        self.assertEqual(
+            evidence["payload_measurement_scope"],
+            "logical_activation_rows_not_dma_launches_or_hardware_counters",
+        )
+        self.assertEqual(evidence["logical_dispatch_saved_activation_bytes"], 16 * 1024 * 2)
+        self.assertEqual(
+            evidence["logical_remote_dispatch_saved_activation_bytes"],
+            12 * 1024 * 2,
+        )
+        self.assertAlmostEqual(
+            evidence["payload_only_bottleneck_saving_ms_at_100_GBps"],
+            payload_bandwidth_time_ms(3 * 1024 * 2, 100),
+        )
+        self.assertEqual(
+            evidence["payload_time_scope"],
+            "max_source_or_destination_bytes_bandwidth_only_excludes_"
+            "topology_dma_startup_contention_and_overlap",
+        )
+
+    def test_payload_bandwidth_time_is_explicit_lower_bound_component(self):
+        self.assertAlmostEqual(payload_bandwidth_time_ms(1_000_000, 100), 0.01)
+        self.assertAlmostEqual(payload_bandwidth_time_ms(10_000, 400), 0.000025)
+        with self.assertRaises(ValueError):
+            payload_bandwidth_time_ms(1, 0)
+
+    def test_packed_launch_model_accounts_for_local_block_size(self):
+        ids, _ = make_controlled_topk(
+            num_tokens=128,
+            top_k=8,
+            num_experts=32,
+            ep_size=4,
+            pattern="one_rank",
+        )
+        source_ranks = infer_contiguous_source_ranks(128, 4)
+
+        self.assertEqual(
+            calculate_packed_rank_dispatch_launches(
+                ids,
+                num_experts=32,
+                ep_size=4,
+                source_ranks=source_ranks,
+                local_block_tokens=32,
+            ),
+            (16, 12),
+        )
+        self.assertEqual(
+            calculate_packed_rank_dispatch_launches(
+                ids,
+                num_experts=32,
+                ep_size=4,
+                source_ranks=source_ranks,
+                local_block_tokens=8,
+            ),
+            (64, 48),
+        )
+        self.assertEqual(
+            calculate_expert_gather_launches(
+                ids,
+                num_experts=32,
+                ep_size=4,
+                source_ranks=source_ranks,
+                local_block_tokens=32,
+            ),
+            (128, 96),
+        )
+
+        self.assertEqual(
+            calculate_rank_broadcast_traffic(
+                ids,
+                num_experts=32,
+                ep_size=4,
+                source_ranks=source_ranks,
+                local_block_tokens=32,
+            ),
+            (16, 12, 512, 384),
+        )
+
+    def test_tail_aware_btc_model_counts_only_nonempty_fixed_tiles(self):
+        # One bt round across two source ranks. Experts 0 and 1 each receive two
+        # rows. Static bts=4 executes two btc=2 groups per active expert; the
+        # tail-aware bound executes one group per expert.
+        ids = np.array([[0], [0], [1], [1]], dtype=np.int32)
+        metrics = calculate_expert_btc_work(
+            ids,
+            num_experts=4,
+            ep_size=2,
+            source_ranks=infer_contiguous_source_ranks(4, 2),
+            local_block_tokens=2,
+            bts=4,
+            btc=2,
+        )
+
+        self.assertEqual(metrics.static_btc_tiles, 4)
+        self.assertEqual(metrics.tail_aware_btc_tiles, 2)
+        self.assertEqual(metrics.saved_btc_tiles, 2)
+        self.assertEqual(metrics.max_rank_static_btc_tiles, 4)
+        self.assertEqual(metrics.max_rank_tail_aware_btc_tiles, 2)
+        self.assertAlmostEqual(metrics.tile_reduction_ratio, 0.5)
+        self.assertAlmostEqual(metrics.critical_rank_tile_reduction_ratio, 0.5)
+
+    def test_tail_aware_btc_model_validates_tile_divisibility(self):
+        with self.assertRaisesRegex(ValueError, "divisible"):
+            calculate_expert_btc_work(
+                np.zeros((4, 1), dtype=np.int32),
+                num_experts=4,
+                ep_size=2,
+                source_ranks=infer_contiguous_source_ranks(4, 2),
+                local_block_tokens=2,
+                bts=3,
+                btc=2,
+            )
 
     def test_random_pattern_is_reproducible_and_has_unique_experts(self):
         first_ids, first_weights = make_controlled_topk(
@@ -257,11 +374,11 @@ class RankRoutingReferenceTest(unittest.TestCase):
             records[0]["measurement_scope"],
             "cpu_route_trace_not_physical_ici_or_latency",
         )
-        self.assertEqual(records[0]["current_v2_dispatch_activation_copies"], 32)
-        self.assertEqual(records[0]["candidate_rank_dispatch_activation_copies"], 4)
+        self.assertEqual(records[0]["logical_current_v2_dispatch_activation_rows"], 32)
+        self.assertEqual(records[0]["logical_rank_dispatch_activation_rows"], 4)
         self.assertEqual(records[0]["dispatch_payload_reduction_ratio"], 0.875)
-        self.assertEqual(records[1]["current_v2_dispatch_activation_copies"], 32)
-        self.assertEqual(records[1]["candidate_rank_dispatch_activation_copies"], 16)
+        self.assertEqual(records[1]["logical_current_v2_dispatch_activation_rows"], 32)
+        self.assertEqual(records[1]["logical_rank_dispatch_activation_rows"], 16)
         self.assertEqual(records[1]["dispatch_payload_reduction_ratio"], 0.5)
 
 

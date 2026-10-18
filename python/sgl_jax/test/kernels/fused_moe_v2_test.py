@@ -6,6 +6,7 @@ Mirrors the style of ``fused_moe_v1_test.py``: build small random inputs, run
 compare. Covers bf16 / fp8 (block-wise + per-channel), the shared expert, grouped
 top-k, the activation variants, and the per-expert SwiGLU clamp.
 """
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -148,6 +149,7 @@ class MoEV2KernelTest(jtu.JaxTestCase):
         bf=128,
         btc=32,
         bse=128,
+        tail_aware_btc=False,
         atol=2e-1,
         rtol=2e-1,
     ):
@@ -213,6 +215,7 @@ class MoEV2KernelTest(jtu.JaxTestCase):
             w2_shared_scale=w2_sh_scale,
             w3_shared_scale=w3_sh_scale,
             direct_scaled_dot=direct_scaled_dot,
+            tail_aware_btc=tail_aware_btc,
             dp_axis_name="data",
             tp_axis_name="tensor",
         )
@@ -368,6 +371,11 @@ class MoEV2KernelTest(jtu.JaxTestCase):
         # local_num_experts).
         self._test_moe(num_experts=32, num_tokens=16, top_k=1)
 
+    def test_tail_aware_btc_skips_only_empty_groups(self):
+        # btc remains a fixed 8-row dot tile; the dynamic bound only removes
+        # wholly empty groups from each expert's final bts=32 tile.
+        self._test_moe(num_experts=32, num_tokens=128, top_k=1, btc=8, tail_aware_btc=True)
+
     # --------------------------------------------------- block config (no TPU)
 
     def test_effective_for_bt_gcd_reduction(self):
@@ -389,7 +397,16 @@ class MoEV2KernelTest(jtu.JaxTestCase):
 
     def test_a2a_mode_contract(self):
         self.assertEqual(validate_fused_moe_a2a_mode("expert"), "expert")
+        self.assertEqual(validate_fused_moe_a2a_mode("rank_direct"), "rank_direct")
+        self.assertEqual(
+            validate_fused_moe_a2a_mode("rank_broadcast"),
+            "rank_broadcast",
+        )
         self.assertEqual(validate_fused_moe_a2a_mode("rank_dispatch"), "rank_dispatch")
+        self.assertEqual(
+            validate_fused_moe_a2a_mode("rank_dispatch_combine"),
+            "rank_dispatch_combine",
+        )
         with self.assertRaisesRegex(ValueError, "Unsupported"):
             validate_fused_moe_a2a_mode("auto")
 

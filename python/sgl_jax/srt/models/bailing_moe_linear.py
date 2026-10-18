@@ -18,6 +18,7 @@ from sgl_jax.srt.layers.embeddings import (
     _deepseek_yarn_get_mscale,
     get_rope,
 )
+from sgl_jax.srt.layers.fused_moe import fused_moe_workload_regime_from_forward_mode
 from sgl_jax.srt.layers.layernorm import RMSNorm
 from sgl_jax.srt.layers.linear import LinearBase
 from sgl_jax.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
@@ -467,6 +468,7 @@ class BailingMoELinearDecoderLayer(nnx.Module):
                 num_shared_experts=num_shared_experts if use_inkernel_se else 0,
                 moe_shared_expert_intermediate_size=moe_shared_expert_intermediate_size,
                 quantization_config=getattr(config, "quantization_config", None),
+                fused_moe_a2a_mode=getattr(config, "fused_moe_a2a_mode", "expert"),
             )
         elif self.moe_backend == MoEBackend.FUSED:
             self.mlp = FusedEPMoE(
@@ -568,7 +570,16 @@ class BailingMoELinearDecoderLayer(nnx.Module):
             if self.use_fused:
                 token_valid_mask = forward_batch.get_token_valid_mask(hidden_states.shape[0])
                 topk_ids = jnp.where(token_valid_mask[:, None], topk_ids, -1)
-            hidden_states = self.mlp(hidden_states, topk_weights, topk_ids)
+            moe_kwargs = (
+                {
+                    "workload_regime": fused_moe_workload_regime_from_forward_mode(
+                        forward_batch.forward_mode
+                    )
+                }
+                if isinstance(self.mlp, FusedEPMoEV2)
+                else {}
+            )
+            hidden_states = self.mlp(hidden_states, topk_weights, topk_ids, **moe_kwargs)
             if shared_output is not None:
                 hidden_states = hidden_states + shared_output
         else:

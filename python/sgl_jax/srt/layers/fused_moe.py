@@ -1,5 +1,7 @@
 """Fused Expert-Parallel MoE layer using Pallas kernel."""
 
+from typing import Literal
+
 import jax
 from flax import nnx
 from jax import numpy as jnp
@@ -9,6 +11,23 @@ from jax.sharding import PartitionSpec as P
 from sgl_jax.srt.eplb.expert_location import get_global_expert_location_metadata
 from sgl_jax.srt.kernels.fused_moe.v1.kernel import FusedMoEBlockConfig, fused_ep_moe
 from sgl_jax.srt.utils.quantization.quantization_utils import quantize_tensor
+
+FusedMoEWorkloadRegime = Literal["auto", "latency", "throughput"]
+
+
+def fused_moe_workload_regime_from_forward_mode(forward_mode) -> FusedMoEWorkloadRegime:
+    """Map unambiguous scheduler modes to an MoE optimization objective.
+
+    ``MIXED`` and speculative modes intentionally remain ``auto`` until they
+    have dedicated measurements. Token count remains part of the tuning key,
+    so the regime supplements rather than replaces shape specialization.
+    """
+    mode_name = getattr(forward_mode, "name", None)
+    if mode_name == "DECODE":
+        return "latency"
+    if mode_name == "EXTEND":
+        return "throughput"
+    return "auto"
 
 
 def _expand_moe_block_scale(scale_3d: jax.Array, n_out: int, block_n: int) -> jax.Array:
@@ -66,6 +85,7 @@ class FusedEPMoE(nnx.Module):
         moe_shared_expert_intermediate_size: int | None = None,
         quantization_config=None,
         enable_act_quant: bool = True,
+        fused_moe_a2a_mode: str = "expert",
         # Profiling / ablation flags (primarily for microbenching).
         disable_a2a: bool = False,
         disable_dynamic_ffn1: bool = False,
@@ -127,6 +147,7 @@ class FusedEPMoE(nnx.Module):
         # Optional explicit disable for in-kernel activation quantization. The
         # positive signal comes from quantization_config.moe_activation_dtype.
         self.enable_act_quant_cfg = enable_act_quant
+        self.fused_moe_a2a_mode = fused_moe_a2a_mode
 
         # Initialize weights.
         self.w1 = nnx.Param(
@@ -554,6 +575,7 @@ class FusedEPMoEV2(FusedEPMoE):
         out_sharding: jax.sharding.Sharding | None = None,
         swiglu_limit: float | None = None,
         shared_swiglu_limit: float | None = None,
+        workload_regime: FusedMoEWorkloadRegime | None = None,
     ) -> jax.Array:
         from sgl_jax.srt.kernels.fused_moe.v2.kernel import fused_ep_moe_v2
         from sgl_jax.srt.kernels.fused_moe.v2.tuned_block_configs import (
@@ -609,6 +631,7 @@ class FusedEPMoEV2(FusedEPMoE):
                 use_grouped_topk=self.use_grouped_topk,
                 enable_act_quant=enable_act_quant,
                 quant_mode=quant_mode,
+                workload_regime=workload_regime,
             )
 
         direct_scaled_dot = w1_scale is not None
@@ -642,6 +665,7 @@ class FusedEPMoEV2(FusedEPMoE):
             w3_shared_scale=w3_shared_scale,
             enable_act_quant=enable_act_quant,
             direct_scaled_dot=direct_scaled_dot,
+            a2a_mode=self.fused_moe_a2a_mode,
             dp_axis_name="data",
             tp_axis_name="tensor",
         )

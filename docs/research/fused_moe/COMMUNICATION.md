@@ -2,49 +2,112 @@
 
 Rank deduplication broadcast and destination combine
 
-Research report prepared on 2026-10-18. Code preserved in
+Research report revision 2 prepared on 2026-10-18. Code preserved in
 [implementation snapshot 5448acf1](https://github.com/spwahaha/sglang-jax/commit/5448acf11e0826efa36b65191ada1590ecb60336).
 
-## Purpose and main finding
+## Existing MoE communication flow
 
-In expert-parallel MoE, a router selects `K` experts per token. Dispatch sends
-activations to the ranks that own those experts; the experts compute their
-outputs, then return them to the source rank for a router-weighted sum.
-SGLang-JAX's existing TPU path transfers one activation row per selected expert,
-so experts on the same rank can receive repeated copies of the same token.
-This creates an opportunity to send one copy per destination rank and reuse it
-locally. We explored that opportunity through rank-deduplicated dispatch,
-direct-row diagnostics, dense rank broadcast, and destination-side combine,
-comparing numerical behavior and whole-kernel latency.
+In expert-parallel mixture-of-experts (MoE), a router selects `K` experts and
+weights for each token. Ranks exchange routing counts to determine expert input
+positions, dispatch activations to the ranks that own the selected experts,
+run the expert feed-forward networks, and return the outputs for a weighted sum
+on the source rank. SGLang-JAX's existing TPU path sends one activation row per
+selected expert, so several experts on the same rank can receive repeated
+copies of the same token. This creates an opportunity to send one copy per
+destination rank and reuse it locally. We investigated this opportunity through
+rank-deduplicated dispatch, direct-row diagnostics, dense rank broadcast, and
+destination-side combine, comparing numerical behavior and whole-kernel latency.
 
-Broadcast asked a specific question: could a few regular dense transfers beat
-precise rank deduplication once packing and local rearrangement were included?
-Sending complete blocks directly from HBM gave about 4–5 percent lower latency
-at global token counts of 32 and 64 in repeated synthetic experiments. The
-benefit disappeared at larger counts. Packed rank dispatch moved fewer logical
-rows but was slower in the completed cases. These results support continued
-experimentation with layout and readiness; they do not establish a serving gain.
+### What happens in the existing expert path
 
-This report covers dispatch, return traffic, data placement, and synchronization.
-Block tuning, VMEM search, and other kernel findings remain in the
-[broader research report](REPORT.md).
+1. The router produces expert IDs and router weights for every token before
+   the fused kernel runs. Each expert-parallel rank owns a subset of experts.
+   The token's source rank retains the information needed to associate returned
+   outputs with the original token and selected routes.
+2. Ranks exchange per-expert token counts. The kernel derives total expert
+   sizes and source-prefix offsets, giving every routed row a distinct input
+   queue position. In the preserved implementation, the `all_reduce_metadata`
+   scope gathers histogram rows from peers and reduces them locally. This
+   metadata exchange is separate from activation payload transfers.
+3. Dispatch sends one activation row per token/expert route. A remote DMA
+   writes directly into the destination expert's final queue slot; a local
+   route uses a local copy. The destination address performs the routing
+   permutation, so no separate rank-to-expert activation rearrangement is
+   required. Only remote transfers consume ICI link traffic.
+4. An expert waits for its own receive completion, loads contiguous input rows,
+   and executes its feed-forward network. Expert-level readiness lets it begin
+   while another expert is still receiving. Dispatch for a later block and
+   output return for a completed expert can overlap other work, subject to
+   buffer availability and completion waits.
+5. Expert outputs return to the source rank, where router weights are applied
+   and contributions are summed for each original token. The BF16 experiments
+   return one logical output row per expert route. Return transfers can group
+   rows by expert and source block, so output-row counts and transfer-start
+   counts are different quantities.
 
-### The baseline already performs useful work during communication
-
-Each dispatch DMA writes directly into the destination expert's final input queue. Its destination
-address performs the routing permutation, so compute can load contiguous rows
-without a separate rank-to-expert rearrangement. Receive readiness is tracked
-per expert: one expert can begin computing while another is still receiving.
-Rotating scratch banks and completion waits protect buffer reuse.
-
-Deduplicating transport must therefore be evaluated together with destination
-layout and readiness. A flat rank inbox saves copies of a vector but still has
-to make that vector available to each selected expert.
+Rotating scratch banks and DMA send/receive semaphores protect outstanding
+transfers. Reusing a buffer requires completion of its previous use. The
+baseline's useful properties are therefore expert-ready placement and fine
+readiness as well as moving the required data.
 
 We use `T` for global token rows in one MoE invocation, `H` for hidden width,
 `I` for expert intermediate width, `E` for expert count, and EP for the number
 of ranks. `T` is not sequence length or a count of decode iterations. All
-latencies below are synthetic-input whole-kernel times on real TPU hardware.
+latencies in this report are synthetic-input whole-kernel times on real TPUs.
+
+<!-- pagebreak -->
+
+## The opportunity and our experiments
+
+### Repeated delivery to the same rank
+
+A token's activation vector is identical across its selected expert routes,
+but the experts use different weights. When multiple selected experts share
+one rank, we can investigate delivering the vector once and fanning it out
+locally. This changes transport and input placement; every selected expert
+still has to compute its own output. Routing identity, Top-K slots, and router
+weights must remain correctly associated with the token.
+
+As a small illustration, let a Top-K 4 token select experts `e0` and `e1` on
+rank A, and `e8` and `e9` on rank B. Expert dispatch makes four activation-row
+copies, two to each rank. Exact rank deduplication makes two copies, one per
+rank, and reuses each at the receiver. All four expert computations remain.
+For an ICI estimate, any copies to the source rank must be excluded.
+
+### What each prototype was intended to test
+
+- `rank_dispatch` packs exactly the selected token/rank rows into contiguous
+  rank buckets. It tests whether fewer activation rows and fewer transfer
+  starts can pay for packing and destination reconstruction.
+- `rank_direct` keeps exact token/rank deduplication but sends individual rows
+  from a staged dense block. It tests whether removing ragged source packing
+  is enough, while accepting more transfer starts than packed dispatch.
+- `rank_broadcast` sends a complete dense source block to each participating
+  rank. It tests whether regular block transfers can outweigh sending unused
+  rows. The later version sends directly from the original HBM input.
+- `rank_dispatch_combine` also combines weighted expert outputs at the
+  destination and returns FP32 rank partials. It explores the return path, but
+  its coupling with packed dispatch limits causal attribution.
+
+Rank-based transport receives a rank inbox rather than the baseline's final
+expert-major queues. The receiver must reconstruct expert membership and
+present contiguous compute inputs. It also needs an appropriate readiness
+protocol. These local steps can offset a logical communication saving.
+
+### What the experiments established
+
+Broadcast asked whether a few regular dense transfers could beat precise rank
+deduplication once packing and rearrangement were included. Sending complete
+blocks directly from HBM gave about 4–5 percent lower latency at global token
+counts of 32 and 64 in repeated synthetic experiments. The benefit disappeared
+at larger counts. Packed rank dispatch moved fewer logical rows but was slower
+in the completed cases. The measurements do not establish a serving gain or
+identify one dominant source of overhead.
+
+This report covers dispatch, return traffic, data placement, and synchronization.
+Block tuning, VMEM search, and other kernel findings remain in the
+[broader research report](REPORT.md). The metadata step above explains the
+baseline; no separate metadata-collective speedup is claimed here.
 
 <!-- pagebreak -->
 

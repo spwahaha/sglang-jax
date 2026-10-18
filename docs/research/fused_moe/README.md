@@ -5,6 +5,9 @@ direct-row dispatch, dense rank broadcast, and destination-side combine. It
 explains why we tried each design, what we implemented, what the measurements
 show, and which explanations still need independent experiments.
 
+The communication report contains the full narrative, tables, and evidence
+links. Its Word edition is generated from that same Markdown text.
+
 The [broader research report](REPORT.md) also covers block tuning, VMEM search,
 and other kernel findings.
 

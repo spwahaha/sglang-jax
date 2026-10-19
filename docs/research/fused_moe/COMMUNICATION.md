@@ -7,20 +7,19 @@
 - **Related work found during exploration:** [DeepEP](https://github.com/deepseek-ai/DeepEP/blob/b5a33eefda39485f438dc764695b71ba7b9249b6/README.md) uses a similar high-level idea on GPUs. We identified it as related work after proposing rank reuse.
 - **Three directions:** exact rank deduplication, regular dense broadcast, and destination-side combine. A direct-row diagnostic tests the role of source packing.
 - **Measured result:** packed dispatch was slower in the completed cases. Broadcast lowered kernel p50 by **4.77% at T=32** and **4.15% at T=64**, then lost its benefit at larger token counts.
-- **Main finding:** the baseline pipelines communication with expert computation and streams completed outputs back. Reducing bytes may save little exposed time, while coarser waits and extra local work can reduce overlap. This is a plausible contributor to the results; its timing impact still needs profiling.
+- **Interpretation to test:** the baseline pipelines communication with expert computation and streams completed outputs back. Reducing bytes may save little exposed time, while coarser waits and extra local work can reduce overlap. This is a plausible contributor to the results; its timing impact still needs profiling.
 
-**Evidence boundary:** these are synthetic TPU kernel experiments from an experimental worktree. The highlighted broadcast runs used matched explicit tiles rather than production-resolved tiles. Serving validation remains pending; the GPU comparison is based on source inspection.
+**Evidence boundary:** these are synthetic TPU kernel experiments from an experimental worktree. The highlighted broadcast runs used matched explicit tiles rather than production-resolved tiles. Serving validation remains pending.
 
 ## Contents
 
 - [Existing MoE communication flow](#existing-moe-communication-flow)
-- [Why pipelining can outweigh byte savings](#why-pipelining-can-outweigh-byte-savings)
 - [Motivation and the optimization directions](#motivation-and-the-optimization-directions)
-- [GPU precedent and DeepEP](#gpu-precedent-and-deepep)
 - [Direction 1 Rank deduplication](#direction-1-rank-deduplication)
 - [Direction 2 Dense rank broadcast](#direction-2-dense-rank-broadcast)
 - [Broadcast measurements and limits](#broadcast-measurements-and-limits)
 - [Direction 3 Destination combine](#direction-3-destination-combine)
+- [Why pipelining can outweigh byte savings](#why-pipelining-can-outweigh-byte-savings)
 - [A controlled combine experiment](#a-controlled-combine-experiment)
 - [Measurement and correctness protocol](#measurement-and-correctness-protocol)
 - [Findings evidence and next experiments](#findings-evidence-and-next-experiments)
@@ -55,35 +54,6 @@ Notation: `T` = global token rows in one MoE invocation; `H` = hidden width; `I`
 
 <!-- pagebreak -->
 
-## Why pipelining can outweigh byte savings
-
-**The baseline is designed to overlap communication with useful computation.** Kernel latency depends on the work exposed on the critical path, so fewer transferred bytes need not translate into an equal reduction in elapsed time.
-
-![Illustrative baseline overlap compared with full rank inbox readiness and receiver preparation before expert computation](figures/communication_pipeline.svg)
-
-Figure 2. Illustrative schedule only, not a measured trace. Bars have no timing scale; actual overlap depends on transfer scheduling, expert load, tiles, and bank configuration.
-
-### What the baseline can overlap
-
-- **Input and compute:** asynchronous dispatch writes final expert queues. After the current expert's receive completes, its FFN can run while later expert inputs are still arriving.
-- **Output and compute:** return DMA starts after each expert finishes, allowing earlier outputs to travel while later experts compute.
-- **Across token blocks:** banked paths can leave returns outstanding while later blocks execute. Dispatch lookahead and the amount of outstanding work depend on the resolved overlap flags, bank depth, and block count.
-
-### What our prototypes change
-
-- **Rank dispatch and broadcast:** the scatter routine reconstructs expert membership and waits for the full rank inbox before the expert loop. A ready expert can therefore wait for unrelated rows. Indexed input preparation also adds local work.
-- **Destination combine:** this prototype starts rank-partial return after the local expert loop, replacing streamed per-expert returns with a later return phase. Fewer return bytes can come with a longer exposed tail.
-
-### What we can conclude
-
-**Saving already-hidden transfer time may not shorten the kernel; lost overlap and added preparation can erase payload savings.** The code establishes these scheduling differences. Historical whole-kernel timings do not quantify their contribution or show that all baseline communication is hidden.
-
-Compare traces for first-expert start, exposed receive waits, compute idle gaps, and the return tail using identical inputs and resolved configurations. Readiness and pipeline ablations must preserve traffic and compute where possible; report resource changes too.
-
-Source: [scatter readiness, per-expert return, and block scheduling](../../../python/sgl_jax/srt/kernels/fused_moe/v2/kernel.py).
-
-<!-- pagebreak -->
-
 ## Motivation and the optimization directions
 
 ### The opportunity
@@ -95,7 +65,7 @@ Source: [scatter readiness, per-expert return, and block scheduling](../../../py
 
 ![Four expert copies compared with two rank deliveries followed by local expert fanout](figures/rank_deduplication.svg)
 
-Figure 3. Top-K 4 across two ranks: four expert copies become two rank deliveries plus local fan-out. Exclude copies to the source rank from ICI estimates.
+Figure 2. Top-K 4 across two ranks: four expert copies become two rank deliveries plus local fan-out. Exclude copies to the source rank from ICI estimates.
 
 ### Questions we tested
 
@@ -114,34 +84,6 @@ The receiver remains part of the optimization:
 - Rank-direct removes ragged packing; broadcast also preserves block transfers. These are diagnostics of different tradeoffs.
 
 Block tuning and VMEM search remain in the [broader report](REPORT.md). Metadata exchange is baseline context here; no independent metadata-collective speedup is claimed.
-
-<!-- pagebreak -->
-
-## GPU precedent and DeepEP
-
-### How we connected the ideas
-
-**We proposed rank reuse from the TPU baseline, then found similar GPU work during exploration.** DeepEP is related work sharing the high-level transport idea; our prototypes were not a port of its implementation.
-
-Two details matter in DeepEP's source and integration:
-
-- Its [EPHandle contract](https://github.com/deepseek-ai/DeepEP/blob/b5a33eefda39485f438dc764695b71ba7b9249b6/deep_ep/buffers/ep.py) counts a received token once per scale-up rank, even when several selected experts are there.
-- Its [recommended integration](https://github.com/deepseek-ai/DeepEP/blob/b5a33eefda39485f438dc764695b71ba7b9249b6/README.md) uses `do_expand=True` and expert alignment for grouped GEMMs. **One transport copy can still become several local expert rows.**
-
-![DeepEP expert expansion compared with indexed consumption in the TPU rank prototype](figures/gpu_tpu_layout.svg)
-
-Figure 4. DeepEP's recommended expanded layout and our TPU rank-inbox consumer have different local input preparation. The TPU row describes this prototype.
-
-### What the comparison tells us
-
-- **DeepEP:** rank-oriented delivery followed by aligned expert segments for compute.
-- **Our rank prototype:** a flat inbox, inbox readiness, expert-membership reconstruction, and dynamic row copies into expert tiles.
-- **Our baseline:** direct expert-queue placement and per-expert readiness.
-- **Both platforms permit overlap.** DeepEP uses asynchronous event/stream integration; [Pallas remote DMA](https://docs.jax.dev/en/latest/pallas/tpu/distributed.html) can start a transfer and wait after other work.
-
-**The useful question is how transport, local layout, and readiness work together.** This comparison establishes neither a GPU/TPU speed ratio nor a fundamental TPU limitation.
-
-Sources inspected at DeepEP revision `b5a33eef` on 2026-10-18. **No GPU benchmark was run.**
 
 <!-- pagebreak -->
 
@@ -202,7 +144,7 @@ Packed dispatch saves rows but adds irregular work. Rank-direct removes packing 
 
 ![Packed dispatch sends only selected rows while broadcast sends the full block to each participating rank](figures/packed_vs_broadcast.svg)
 
-Figure 5. Packing sends two useful rows; broadcast sends the two-row block to both ranks. The receiver filters unused rows.
+Figure 3. Packing sends two useful rows; broadcast sends the two-row block to both ranks. The receiver filters unused rows.
 
 The direct-HBM version:
 
@@ -284,7 +226,7 @@ In `rank_dispatch_combine`:
 
 ![Expert outputs are weighted and accumulated into FP32 rank partials before return to the source](figures/destination_combine.svg)
 
-Figure 6. All experts still compute. Moving the sum changes accumulation order and return precision.
+Figure 4. All experts still compute. Moving the sum changes accumulation order and return precision.
 
 ### Precision determines byte savings
 
@@ -303,6 +245,35 @@ Figure 6. All experts still compute. Moving the sum changes accumulation order a
 **This comparison changes dispatch and combine together. It does not show that destination combine alone is slower.** It includes packed dispatch, extra weight metadata, FP32 accumulation/return, buffer changes, and synchronization effects.
 
 Source: [combine design and numerical evidence](../../developer_guide/fused_moe_rank_dispatch_consultation_brief.md).
+
+<!-- pagebreak -->
+
+## Why pipelining can outweigh byte savings
+
+**Packed dispatch was slower, broadcast helped only a narrow small-token region, and the complete combine prototype did not beat the baseline.** These results motivate examining how the baseline pipelines communication with computation. Reducing bytes may have little benefit when transfers are hidden, while coarser readiness can add exposed delays.
+
+![Illustrative baseline overlap compared with full rank inbox readiness and receiver preparation before expert computation](figures/communication_pipeline.svg)
+
+Figure 5. Illustrative schedule only, not a measured trace. Bars have no timing scale; actual overlap depends on transfer scheduling, expert load, tiles, and bank configuration.
+
+### What the baseline can overlap
+
+- **Input and compute:** asynchronous dispatch writes final expert queues. After the current expert's receive completes, its FFN can run while later expert inputs are still arriving.
+- **Output and compute:** return DMA starts after each expert finishes, allowing earlier outputs to travel while later experts compute.
+- **Across token blocks:** banked paths can leave returns outstanding while later blocks execute. Dispatch lookahead and the amount of outstanding work depend on the resolved overlap flags, bank depth, and block count.
+
+### What our prototypes change
+
+- **Rank dispatch and broadcast:** the scatter routine reconstructs expert membership and waits for the full rank inbox before the expert loop. A ready expert can therefore wait for unrelated rows. Indexed input preparation also adds local work.
+- **Destination combine:** this prototype starts rank-partial return after the local expert loop, replacing streamed per-expert returns with a later return phase. Fewer return bytes can come with a longer exposed tail.
+
+### What we can conclude
+
+**Saving already-hidden transfer time may not shorten the kernel; lost overlap and added preparation can erase payload savings.** The code establishes these scheduling differences. Historical whole-kernel timings do not quantify their contribution or show that all baseline communication is hidden.
+
+Compare traces for first-expert start, exposed receive waits, compute idle gaps, and the return tail using identical inputs and resolved configurations. Readiness and pipeline ablations must preserve traffic and compute where possible; report resource changes too.
+
+Source: [scatter readiness, per-expert return, and block scheduling](../../../python/sgl_jax/srt/kernels/fused_moe/v2/kernel.py).
 
 <!-- pagebreak -->
 

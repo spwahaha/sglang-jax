@@ -8,9 +8,8 @@ show, and which explanations still need independent experiments.
 The communication report contains the full narrative, tables, and evidence
 links. Its Word edition is generated from that same Markdown text.
 The opening overview and linked contents organize the three communication
-directions. Shared [SVG diagrams](figures/) explain the baseline, pipeline overlap, rank reuse,
-DeepEP layout comparison, dense broadcast, and destination combine in both
-editions. The report also separates historical combine results from a
+directions. Shared [SVG diagrams](figures/) explain the baseline, rank reuse,
+dense broadcast, destination combine, and pipeline overlap in both editions. The report also separates historical combine results from a
 proposed return-only benchmark, controlled comparison matrix, and measurement
 protocol.
 

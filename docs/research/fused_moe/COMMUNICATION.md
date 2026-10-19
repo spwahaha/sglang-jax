@@ -1,9 +1,4 @@
-# TPU MoE Communication Experiments
-
-Rank deduplication broadcast and destination combine
-
-Research report revision 4 prepared on 2026-10-18. Code:
-[implementation snapshot 5448acf1](https://github.com/spwahaha/sglang-jax/commit/5448acf11e0826efa36b65191ada1590ecb60336).
+# MoE Communication Optimization Exploration
 
 ## TLDR
 

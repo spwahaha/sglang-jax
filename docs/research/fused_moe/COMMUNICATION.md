@@ -7,13 +7,14 @@
 - **Related work found during exploration:** [DeepEP](https://github.com/deepseek-ai/DeepEP/blob/b5a33eefda39485f438dc764695b71ba7b9249b6/README.md) uses a similar high-level idea on GPUs. We identified it as related work after proposing rank reuse.
 - **Three directions:** exact rank deduplication, regular dense broadcast, and destination-side combine. A direct-row diagnostic tests the role of source packing.
 - **Measured result:** packed dispatch was slower in the completed cases. Broadcast lowered kernel p50 by **4.77% at T=32** and **4.15% at T=64**, then lost its benefit at larger token counts.
-- **Main finding:** fewer logical bytes alone do not guarantee lower latency. Expert input layout, local work, and readiness must be considered together.
+- **Main finding:** the baseline pipelines communication with expert computation and streams completed outputs back. Reducing bytes may save little exposed time, while coarser waits and extra local work can reduce overlap. This is a plausible contributor to the results; its timing impact still needs profiling.
 
 **Evidence boundary:** these are synthetic TPU kernel experiments from an experimental worktree. The highlighted broadcast runs used matched explicit tiles rather than production-resolved tiles. Serving validation remains pending; the GPU comparison is based on source inspection.
 
 ## Contents
 
 - [Existing MoE communication flow](#existing-moe-communication-flow)
+- [Why pipelining can outweigh byte savings](#why-pipelining-can-outweigh-byte-savings)
 - [Motivation and the optimization directions](#motivation-and-the-optimization-directions)
 - [GPU precedent and DeepEP](#gpu-precedent-and-deepep)
 - [Direction 1 Rank deduplication](#direction-1-rank-deduplication)
@@ -46,10 +47,40 @@ Figure 1. Routing and count exchange → dispatch → expert computation → ret
 
 - **Direct placement:** DMA destination addresses perform the routing permutation into expert-major queues.
 - **Fine readiness:** an expert can proceed when its own input is ready.
+- **Pipelined communication and computation:** later expert inputs can arrive during current expert compute; completed expert outputs can return during later compute. Cross-block overlap depends on the configured pipeline and bank depth.
 - **Safe reuse:** rotating banks and completion waits protect outstanding transfers.
 - **Local traffic accounting:** local copies do not consume ICI link traffic.
 
 Notation: `T` = global token rows in one MoE invocation; `H` = hidden width; `I` = expert intermediate width; `E` = expert count; `K` = selected experts per token; EP = expert-parallel ranks. `T` is not sequence length or a number of decode iterations.
+
+<!-- pagebreak -->
+
+## Why pipelining can outweigh byte savings
+
+**The baseline is designed to overlap communication with useful computation.** Kernel latency depends on the work exposed on the critical path, so fewer transferred bytes need not translate into an equal reduction in elapsed time.
+
+![Illustrative baseline overlap compared with full rank inbox readiness and receiver preparation before expert computation](figures/communication_pipeline.svg)
+
+Figure 2. Illustrative schedule only, not a measured trace. Bars have no timing scale; actual overlap depends on transfer scheduling, expert load, tiles, and bank configuration.
+
+### What the baseline can overlap
+
+- **Input and compute:** asynchronous dispatch writes final expert queues. After the current expert's receive completes, its FFN can run while later expert inputs are still arriving.
+- **Output and compute:** return DMA starts after each expert finishes, allowing earlier outputs to travel while later experts compute.
+- **Across token blocks:** banked paths can leave returns outstanding while later blocks execute. Dispatch lookahead and the amount of outstanding work depend on the resolved overlap flags, bank depth, and block count.
+
+### What our prototypes change
+
+- **Rank dispatch and broadcast:** the scatter routine reconstructs expert membership and waits for the full rank inbox before the expert loop. A ready expert can therefore wait for unrelated rows. Indexed input preparation also adds local work.
+- **Destination combine:** this prototype starts rank-partial return after the local expert loop, replacing streamed per-expert returns with a later return phase. Fewer return bytes can come with a longer exposed tail.
+
+### What we can conclude
+
+**Saving already-hidden transfer time may not shorten the kernel; lost overlap and added preparation can erase payload savings.** The code establishes these scheduling differences. Historical whole-kernel timings do not quantify their contribution or show that all baseline communication is hidden.
+
+Compare traces for first-expert start, exposed receive waits, compute idle gaps, and the return tail using identical inputs and resolved configurations. Readiness and pipeline ablations must preserve traffic and compute where possible; report resource changes too.
+
+Source: [scatter readiness, per-expert return, and block scheduling](../../../python/sgl_jax/srt/kernels/fused_moe/v2/kernel.py).
 
 <!-- pagebreak -->
 
@@ -64,7 +95,7 @@ Notation: `T` = global token rows in one MoE invocation; `H` = hidden width; `I`
 
 ![Four expert copies compared with two rank deliveries followed by local expert fanout](figures/rank_deduplication.svg)
 
-Figure 2. Top-K 4 across two ranks: four expert copies become two rank deliveries plus local fan-out. Exclude copies to the source rank from ICI estimates.
+Figure 3. Top-K 4 across two ranks: four expert copies become two rank deliveries plus local fan-out. Exclude copies to the source rank from ICI estimates.
 
 ### Questions we tested
 
@@ -99,7 +130,7 @@ Two details matter in DeepEP's source and integration:
 
 ![DeepEP expert expansion compared with indexed consumption in the TPU rank prototype](figures/gpu_tpu_layout.svg)
 
-Figure 3. DeepEP's recommended expanded layout and our TPU rank-inbox consumer have different local input preparation. The TPU row describes this prototype.
+Figure 4. DeepEP's recommended expanded layout and our TPU rank-inbox consumer have different local input preparation. The TPU row describes this prototype.
 
 ### What the comparison tells us
 
@@ -131,7 +162,7 @@ Sources inspected at DeepEP revision `b5a33eef` on 2026-10-18. **No GPU benchmar
 3. Transfer each nonempty source-block/destination-rank bucket.
 4. Reconstruct expert-to-inbox indices and load selected rows into contiguous expert tiles.
 
-**Readiness changes too:** the prototype waits for the rank inbox before entering its expert loop, replacing the baseline's per-expert receive waits.
+**Readiness changes too:** the prototype waits for the full rank inbox before entering its expert loop, replacing per-expert receive waits and potentially reducing [communication/compute overlap](#why-pipelining-can-outweigh-byte-savings).
 
 ### Results
 
@@ -171,7 +202,7 @@ Packed dispatch saves rows but adds irregular work. Rank-direct removes packing 
 
 ![Packed dispatch sends only selected rows while broadcast sends the full block to each participating rank](figures/packed_vs_broadcast.svg)
 
-Figure 4. Packing sends two useful rows; broadcast sends the two-row block to both ranks. The receiver filters unused rows.
+Figure 5. Packing sends two useful rows; broadcast sends the two-row block to both ranks. The receiver filters unused rows.
 
 The direct-HBM version:
 
@@ -230,6 +261,7 @@ Sources: [kernel](../../../python/sgl_jax/srt/kernels/fused_moe/v2/kernel.py) an
 
 - Fewer starts and regular transfers may help at small `T`.
 - Extra payload and receiver work may absorb that saving as `T` grows.
+- Full-inbox readiness may reduce the baseline's communication/compute overlap, limiting the benefit of regular transfers.
 - **Whole-kernel timing does not isolate those mechanisms.**
 
 Keep broadcast experimental. Recheck exact production tiles, model routing, per-case correctness, and repeated timings before real-server TTFT, TPOT/ITL, throughput, and memory measurements.
@@ -252,7 +284,7 @@ In `rank_dispatch_combine`:
 
 ![Expert outputs are weighted and accumulated into FP32 rank partials before return to the source](figures/destination_combine.svg)
 
-Figure 5. All experts still compute. Moving the sum changes accumulation order and return precision.
+Figure 6. All experts still compute. Moving the sum changes accumulation order and return precision.
 
 ### Precision determines byte savings
 
@@ -355,7 +387,7 @@ Only candidates that pass correctness and repeated kernel comparisons should pro
 
 ### Findings and next actions
 
-- **Packed dispatch:** fewer logical rows, but higher completed kernel latency. Revisit local input layout and readiness only after identifying exposed cost.
+- **Packed dispatch:** fewer logical rows, but higher completed kernel latency. Coarser inbox readiness and local preparation may offset savings from transfers the baseline can overlap; confirm with traces and controlled ablations.
 - **Broadcast:** a small-token benefit in matched-tile experiments. Recheck production-resolved tiles and actual model routing.
 - **Combine:** the complete packed/combine prototype was slower than `expert`; combine's independent effect remains open. Run the paired control and proposed matrix above.
 - **Serving:** no MoE communication change here has checkpoint-backed qualification. Keep `expert` as the default.

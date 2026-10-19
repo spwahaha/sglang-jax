@@ -10,7 +10,9 @@ links. Its Word edition is generated from that same Markdown text.
 The opening overview and linked contents organize the three communication
 directions. Shared [SVG diagrams](figures/) explain the baseline, rank reuse,
 DeepEP layout comparison, dense broadcast, and destination combine in both
-editions.
+editions. The report also separates historical combine results from a
+proposed return-only benchmark, controlled comparison matrix, and measurement
+protocol.
 
 The [broader research report](REPORT.md) also covers block tuning, VMEM search,
 and other kernel findings.

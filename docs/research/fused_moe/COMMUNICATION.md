@@ -2,31 +2,19 @@
 
 Rank deduplication broadcast and destination combine
 
-Research report revision 3 prepared on 2026-10-18. Code preserved in
+Research report revision 4 prepared on 2026-10-18. Code:
 [implementation snapshot 5448acf1](https://github.com/spwahaha/sglang-jax/commit/5448acf11e0826efa36b65191ada1590ecb60336).
 
 ## TLDR
 
-This work began with a communication opportunity in SGLang-JAX's fused MoE
-kernel on TPU. The existing path dispatches a token's activation once for each
-selected expert and returns expert outputs for a weighted sum. If several of
-those experts share a rank, the same activation is delivered repeatedly to that
-rank. We investigated sending it once per destination rank and reusing it
-locally, while preserving the expert computations and routing semantics.
+- **The existing path dispatches a token's activation once for each selected expert and returns expert outputs for a weighted sum.** Several selected experts on one rank therefore receive repeated copies.
+- **Our idea:** send the activation once per destination rank and reuse it locally. We derived this idea from the repeated transfers in the TPU kernel.
+- **Related work found during exploration:** [DeepEP](https://github.com/deepseek-ai/DeepEP/blob/b5a33eefda39485f438dc764695b71ba7b9249b6/README.md) uses a similar high-level idea on GPUs. We identified it as related work after proposing rank reuse.
+- **Three directions:** exact rank deduplication, regular dense broadcast, and destination-side combine. A direct-row diagnostic tests the role of source packing.
+- **Measured result:** packed dispatch was slower in the completed cases. Broadcast lowered kernel p50 by **4.77% at T=32** and **4.15% at T=64**, then lost its benefit at larger token counts.
+- **Main finding:** fewer logical bytes alone do not guarantee lower latency. Expert input layout, local work, and readiness must be considered together.
 
-We examined related GPU work, including [DeepEP](https://github.com/deepseek-ai/DeepEP/blob/b5a33eefda39485f438dc764695b71ba7b9249b6/README.md),
-which shares the high-level idea of rank-oriented MoE dispatch and combine.
-Our TPU work explored three optimization directions: exact rank deduplication,
-regular dense block broadcast, and destination-side combine. A direct-row
-variant helped test whether source packing alone explained the cost.
-
-Controlled prototypes and TPU experiments showed that fewer logical bytes did
-not guarantee lower kernel latency. Packed dispatch was slower in the completed
-cases. Broadcast reduced kernel p50 by about 4–5 percent at small token counts,
-but the benefit disappeared at larger counts. The main engineering question is
-how to preserve efficient expert input layout and communication/compute overlap
-after reducing transfers. These are synthetic kernel results, not a qualified
-serving improvement. The DeepEP comparison is based on source inspection.
+**Evidence boundary:** these are synthetic TPU kernel experiments from an experimental worktree. The highlighted broadcast runs used matched explicit tiles rather than production-resolved tiles. Serving validation remains pending; the GPU comparison is based on source inspection.
 
 ## Contents
 
@@ -37,80 +25,51 @@ serving improvement. The DeepEP comparison is based on source inspection.
 - [Direction 2 Dense rank broadcast](#direction-2-dense-rank-broadcast)
 - [Broadcast measurements and limits](#broadcast-measurements-and-limits)
 - [Direction 3 Destination combine](#direction-3-destination-combine)
+- [A controlled combine experiment](#a-controlled-combine-experiment)
+- [Measurement and correctness protocol](#measurement-and-correctness-protocol)
 - [Findings evidence and next experiments](#findings-evidence-and-next-experiments)
 
 <!-- pagebreak -->
 
 ## Existing MoE communication flow
 
-In expert-parallel MoE, a router selects `K` experts and weights per token.
-Each rank owns a subset of experts. Ranks exchange routing counts, dispatch
-activations, run the selected experts, return their outputs, and form a weighted
-sum on the token's source rank. Figure 1 shows the logical stages; the kernel
-can overlap parts of these stages rather than executing global barriers
-between all of them.
+A router selects `K` experts and weights per token. Each expert-parallel rank owns a subset of experts. The logical flow is:
 
 ![MoE flow from routing metadata through expert dispatch computation return and weighted combine](figures/communication_flow.svg)
 
-Figure 1. Baseline MoE flow. Dispatch places rows directly into expert input
-queues, and receive readiness is tracked per expert.
+Figure 1. Routing and count exchange → dispatch → expert computation → return → weighted combine. DMA and compute can overlap.
 
-### What happens in the existing expert path
+### The five stages
 
-1. The router produces expert IDs and router weights for every token before
-   the fused kernel runs. Each expert-parallel rank owns a subset of experts.
-   The token's source rank retains the information needed to associate returned
-   outputs with the original token and selected routes.
-2. Ranks exchange per-expert token counts. The kernel derives total expert
-   sizes and source-prefix offsets, giving every routed row a distinct input
-   queue position. In the preserved implementation, the `all_reduce_metadata`
-   scope gathers histogram rows from peers and reduces them locally. This
-   metadata exchange is separate from activation payload transfers.
-3. Dispatch sends one activation row per token/expert route. A remote DMA
-   writes directly into the destination expert's final queue slot; a local
-   route uses a local copy. The destination address performs the routing
-   permutation, so no separate rank-to-expert activation rearrangement is
-   required. Only remote transfers consume ICI link traffic.
-4. An expert waits for its own receive completion, loads contiguous input rows,
-   and executes its feed-forward network. Expert-level readiness lets it begin
-   while another expert is still receiving. Dispatch for a later block and
-   output return for a completed expert can overlap other work, subject to
-   buffer availability and completion waits.
-5. Expert outputs return to the source rank, where router weights are applied
-   and contributions are summed for each original token. The BF16 experiments
-   return one logical output row per expert route. Return transfers can group
-   rows by expert and source block, so output-row counts and transfer-start
-   counts are different quantities.
+1. **Route:** produce expert IDs and router weights before the fused kernel runs. Retain the token/route identity needed to combine returned outputs.
+2. **Exchange counts:** collect per-expert token counts and derive expert sizes and source-prefix offsets. The preserved `all_reduce_metadata` scope gathers peer histogram rows and reduces them locally.
+3. **Dispatch one activation row per token/expert route.** Remote DMA writes directly into the selected expert's final queue slot; local routes use local copies. Several experts on one rank can therefore receive repeated copies of the same activation.
+4. **Compute:** wait for the current expert's receive completion, load contiguous input rows, and run its FFN. Later experts can still be receiving; later-block dispatch and completed-expert return can overlap other work.
+5. **Return and combine:** return expert output rows, then apply router weights and sum on the source. Return DMA can group rows by expert and source block: **row counts and transfer-start counts differ**.
 
-Rotating scratch banks and DMA send/receive semaphores protect outstanding
-transfers. Reusing a buffer requires completion of its previous use. The
-baseline's useful properties are therefore expert-ready placement and fine
-readiness as well as moving the required data.
+### What the baseline already does well
 
-We use `T` for global token rows in one MoE invocation, `H` for hidden width,
-`I` for expert intermediate width, `E` for expert count, and EP for the number
-of ranks. `T` is not sequence length or a count of decode iterations. All
-latencies in this report are synthetic-input whole-kernel times on real TPUs.
+- **Direct placement:** DMA destination addresses perform the routing permutation into expert-major queues.
+- **Fine readiness:** an expert can proceed when its own input is ready.
+- **Safe reuse:** rotating banks and completion waits protect outstanding transfers.
+- **Local traffic accounting:** local copies do not consume ICI link traffic.
+
+Notation: `T` = global token rows in one MoE invocation; `H` = hidden width; `I` = expert intermediate width; `E` = expert count; `K` = selected experts per token; EP = expert-parallel ranks. `T` is not sequence length or a number of decode iterations.
 
 <!-- pagebreak -->
 
 ## Motivation and the optimization directions
 
-### Repeated delivery to the same rank
+### The opportunity
 
-A token's activation vector is identical across its selected expert routes,
-but the experts use different weights. If several selected experts share one
-rank, dispatch repeats delivery of the same vector. We treated this as an
-opportunity to investigate, not proof that communication dominated kernel time.
-Every selected expert must still compute its own output, and expert IDs,
-Top-K slots, and router weights must remain associated with the original token.
+- A token's input vector is identical across its selected expert routes.
+- **Several experts on one rank can reuse one delivered copy.** Each expert still applies its own weights and computes its own output.
+- Expert IDs, Top-K slots, router weights, and token identity must remain aligned.
+- Repeated delivery suggests an opportunity; it does not prove that communication dominates kernel time.
 
 ![Four expert copies compared with two rank deliveries followed by local expert fanout](figures/rank_deduplication.svg)
 
-Figure 2. Illustrative Top-K 4 routing to two ranks. Exact rank deduplication
-reduces activation copies from four to two. It does not remove any expert
-computation. Copies to the source rank are local and must be excluded from an
-ICI traffic estimate.
+Figure 2. Top-K 4 across two ranks: four expert copies become two rank deliveries plus local fan-out. Exclude copies to the source rank from ICI estimates.
 
 ### Questions we tested
 
@@ -120,110 +79,84 @@ ICI traffic estimate.
 | Regular transfers | `rank_broadcast` | Can simpler block DMAs repay extra rows? |
 | Return reduction | `rank_dispatch_combine` | Can local weighted sums reduce return cost? |
 
-We built routing references, controlled routing patterns, logical payload and
-start-count models, and TPU comparisons. Rank-direct removes ragged source
-packing while preserving exact deduplication, helping test one part of the
-packed design. Broadcast removes packing and keeps block transfers, accepting
-unused rows. Destination combine changes both weighting location and return
-precision; its coupled prototype needs an independent ablation.
+We built **CPU routing references, controlled routing patterns, payload/start-count models, and TPU comparisons**.
 
-A rank inbox still has to become usable expert input. Reconstruction, local
-fan-out, and readiness are part of the cost we tested. Block tuning and VMEM
-search remain in the [broader research report](REPORT.md). Metadata exchange
-is included as baseline context; no independent metadata-collective speedup is
-claimed in this report.
+The receiver remains part of the optimization:
+
+- Rank transport produces an inbox, which must become usable expert input.
+- Reconstruction, local fan-out, indexed loads, and readiness can offset saved payload.
+- Rank-direct removes ragged packing; broadcast also preserves block transfers. These are diagnostics of different tradeoffs.
+
+Block tuning and VMEM search remain in the [broader report](REPORT.md). Metadata exchange is baseline context here; no independent metadata-collective speedup is claimed.
 
 <!-- pagebreak -->
 
 ## GPU precedent and DeepEP
 
-### The shared idea
+### How we connected the ideas
 
-GPU work provides a concrete precedent for rank-oriented expert communication.
-DeepEP's [EPHandle source](https://github.com/deepseek-ai/DeepEP/blob/b5a33eefda39485f438dc764695b71ba7b9249b6/deep_ep/buffers/ep.py)
-describes received-token accounting that counts a token once per scale-up rank,
-even when several selected experts are on that rank. This matches the input
-reuse opportunity behind our exact rank-deduplication prototypes.
+**We proposed rank reuse from the TPU baseline, then found similar GPU work during exploration.** DeepEP is related work sharing the high-level transport idea; our prototypes were not a port of its implementation.
 
-Its [recommended integration](https://github.com/deepseek-ai/DeepEP/blob/b5a33eefda39485f438dc764695b71ba7b9249b6/README.md)
-also requests `do_expand=True` and expert alignment for grouped expert GEMMs.
-The transport representation and the compute representation serve different
-purposes: a vector can be delivered once to a rank, then appear in several
-local expert segments. Local fan-out remains necessary.
+Two details matter in DeepEP's source and integration:
+
+- Its [EPHandle contract](https://github.com/deepseek-ai/DeepEP/blob/b5a33eefda39485f438dc764695b71ba7b9249b6/deep_ep/buffers/ep.py) counts a received token once per scale-up rank, even when several selected experts are there.
+- Its [recommended integration](https://github.com/deepseek-ai/DeepEP/blob/b5a33eefda39485f438dc764695b71ba7b9249b6/README.md) uses `do_expand=True` and expert alignment for grouped GEMMs. **One transport copy can still become several local expert rows.**
 
 ![DeepEP expert expansion compared with indexed consumption in the TPU rank prototype](figures/gpu_tpu_layout.svg)
 
-Figure 3. The shared transport idea leads to different compute inputs. The
-DeepEP path shown is its recommended expanded layout; the TPU row describes
-our experimental rank-inbox consumer, not every possible TPU implementation.
+Figure 3. DeepEP's recommended expanded layout and our TPU rank-inbox consumer have different local input preparation. The TPU row describes this prototype.
 
-### What we learned from the comparison
+### What the comparison tells us
 
-Our TPU prototype retained a flat inbox, reconstructed expert membership,
-waited for the expected inbox payload, and dynamically copied rows into expert
-tiles. The baseline instead writes directly into expert queues and exposes
-per-expert readiness. Comparing only rank-deduplicated bytes hides this
-consumer-side difference.
+- **DeepEP:** rank-oriented delivery followed by aligned expert segments for compute.
+- **Our rank prototype:** a flat inbox, inbox readiness, expert-membership reconstruction, and dynamic row copies into expert tiles.
+- **Our baseline:** direct expert-queue placement and per-expert readiness.
+- **Both platforms permit overlap.** DeepEP uses asynchronous event/stream integration; [Pallas remote DMA](https://docs.jax.dev/en/latest/pallas/tpu/distributed.html) can start a transfer and wait after other work.
 
-DeepEP's asynchronous event/stream integration and Pallas remote DMA both
-permit overlap. The [Pallas documentation](https://docs.jax.dev/en/latest/pallas/tpu/distributed.html)
-explicitly supports starting a remote DMA and doing other work before waiting.
-The question is how a particular layout and readiness protocol uses that
-capability. GPU precedent does not establish a TPU speedup, and these
-experiments do not show that rank deduplication is unsuitable for TPU.
+**The useful question is how transport, local layout, and readiness work together.** This comparison establishes neither a GPU/TPU speed ratio nor a fundamental TPU limitation.
 
-DeepEP sources were inspected at revision `b5a33eef` on 2026-10-18. We did not
-run a GPU benchmark or port DeepEP's implementation.
+Sources inspected at DeepEP revision `b5a33eef` on 2026-10-18. **No GPU benchmark was run.**
 
 <!-- pagebreak -->
 
 ## Direction 1 Rank deduplication
 
-### Why we tried deduplicating by rank
+### Idea and payload model
 
-If a Top-K 8 token selects eight experts on one rank, the baseline sends eight
-copies of the same activation to that rank. Sending one copy and reusing it
-locally reduces logical activation rows by 87.5 percent. If the eight experts
-span three ranks, the count falls from eight rows to three. The benefit depends
-on actual route fan-out and expert placement.
+- A Top-K 8 token selecting eight experts on one rank needs eight expert copies but only one rank delivery: **87.5% fewer logical activation rows**.
+- If those experts span three ranks, exact deduplication sends three rows instead of eight.
+- For BF16, expert dispatch is `2 * T * K * H` bytes; exact rank dispatch is `2 * T * R * H`, where `R` is mean distinct destination ranks per token.
 
-For BF16, the global logical dispatch payload is `2 * T * K * H` bytes.
-Exact rank deduplication changes this to `2 * T * R * H`, where `R` is the mean
-number of distinct destination ranks per token. An ICI estimate must exclude
-local routes and local rank copies. Neither formula measures physical link
-traffic, metadata overhead, or communication exposed on the critical path.
+**This is a payload model, not a latency measurement.** Exclude local routes for ICI estimates. Metadata, transfer startup, contention, and overlap also matter.
 
-### What we implemented
+### Implementation
 
-In `rank_dispatch`, we scan routes, deduplicate destinations, and pack selected
-activation rows into contiguous per-rank VMEM buckets. One variable-size
-transfer carries each nonempty source-block and destination-rank bucket.
-Routing metadata lets the receiver reconstruct expert-to-inbox indices and
-load the selected rows into contiguous expert compute tiles.
+1. Scan routes and deduplicate destination ranks per token.
+2. Pack selected rows into contiguous per-rank VMEM buckets.
+3. Transfer each nonempty source-block/destination-rank bucket.
+4. Reconstruct expert-to-inbox indices and load selected rows into contiguous expert tiles.
 
-The prototype waits for the rank inbox before its expert loop. It therefore
-changes source work, destination consumption, and readiness as well as payload.
-The baseline's direct placement and per-expert receive events are meaningful
-parts of the comparison.
+**Readiness changes too:** the prototype waits for the rank inbox before entering its expert loop, replacing the baseline's per-expert receive waits.
 
-### What the completed experiments showed
+### Results
 
-Historical single-run means on v6e-4 used BF16, `E=32`, `K=8`, `I=1024`, and
-controlled routing with one destination rank per token. Reported numerical
-comparisons passed. These runs came from an experimental working revision.
+Historical single-run means: **v6e-4, BF16, E=32, K=8, I=1024, one destination rank per token**. Reported numerical checks passed; runs came from an experimental working revision.
 
 | Global T | H | Expert ms | Rank packed ms | Latency change |
 |---:|---:|---:|---:|---:|
-| 128 | 1024 | 0.071 | 0.106 | 49.3 percent higher |
-| 128 | 8192 | 0.328 | 0.337 | 2.7 percent higher |
-| 512 | 8192 | 1.258 | 1.334 | 6.0 percent higher |
+| 128 | 1024 | 0.071 | 0.106 | **49.3% higher** |
+| 128 | 8192 | 0.328 | 0.337 | **2.7% higher** |
+| 512 | 8192 | 1.258 | 1.334 | **6.0% higher** |
 
-The `rank_direct` diagnostic kept exact token/rank deduplication but removed
-ragged source packing. It staged the dense source block, then sent individual
-rows into fixed rank-inbox slots. Historical notes report correct output and
-latency similar to packed dispatch at `T=128`; a separate timing table was not
-retained. This argues against packing being the sole cause of the regression.
-It does not isolate the cost of destination reconstruction or lost overlap.
+**Fewer logical rows did not make the complete path faster in these cases.**
+
+### Rank direct diagnostic
+
+- `rank_direct` stages the dense block and sends individual token/rank rows, removing ragged source packing.
+- Historical notes report correct output and latency similar to packed dispatch at `T=128`; no standalone timing table was retained.
+- Removing packing did not recover the baseline. This argues against packing as the sole cause, but does not isolate destination or overlap costs.
+
+**Decision:** retain as research; keep `expert` as the default.
 
 Source: [dispatch experiments and numerical notes](../../developer_guide/fused_moe_rank_dispatch_consultation_brief.md).
 
@@ -231,38 +164,29 @@ Source: [dispatch experiments and numerical notes](../../developer_guide/fused_m
 
 ## Direction 2 Dense rank broadcast
 
-### The question after exact deduplication
+### Why try sending extra rows
 
-Packed dispatch reduced rows but introduced irregular work. Rank-direct removed
-packing but still issued one transfer for every selected token/rank pair.
-We tried `rank_broadcast` to retain few regular transfers while also removing
-source packing. It deliberately sends extra rows, allowing us to explore the
-tradeoff between payload volume and transfer regularity.
+Packed dispatch saves rows but adds irregular work. Rank-direct removes packing but still starts a transfer per selected token/rank pair. **Broadcast tests regular block transfers without source packing**, accepting unused rows.
 
-### What the broadcast path does
+### How it works
 
-For each dense `bt * H` source block, `rank_broadcast` sends the unchanged
-block once to every rank selected by at least one token in that block.
-Metadata identifies the useful rows and experts at the receiver. It therefore
-trades extra activation rows for regular block transfers.
+- Start with the original dense `bt * H` source block.
+- Send it once to each rank selected by any token in that block.
+- Use routing metadata at the receiver to select useful rows and local experts.
 
 ![Packed dispatch sends only selected rows while broadcast sends the full block to each participating rank](figures/packed_vs_broadcast.svg)
 
-Figure 4. Two tokens target different ranks. Packing sends two rows in total;
-broadcast sends four. The amplification depends on the ranks touched within
-each source block.
+Figure 4. Packing sends two useful rows; broadcast sends the two-row block to both ranks. The receiver filters unused rows.
 
-The later direct-HBM version uses the original dense input as the DMA source.
-It removed an unused approximately 5 MiB source VMEM staging buffer and its
-semaphore. It still needs destination reconstruction, indexed expert loads,
-and inbox readiness; it does not recreate the baseline expert-major layout.
+The direct-HBM version:
 
-### A controlled comparison of the transport choices
+- Uses the **original HBM block** as the DMA source.
+- Removes an unused approximately **5 MiB source staging buffer** and its semaphore.
+- Still needs destination reconstruction, indexed loads, and inbox readiness.
 
-For `T=128`, `K=8`, EP=4, and `bt=32`, the controlled one-rank-per-token pattern
-touches all four ranks within each source block. Counts below are global
-algorithmic activation-transfer counts, including local copies. They exclude
-metadata and source staging and are not hardware counters.
+### Controlled transport counts
+
+For `T=128`, `K=8`, EP=4, `bt=32`, each source block in the controlled one-rank-per-token pattern touches all four ranks:
 
 | Dispatch mode | Rows | Transfer starts | Source treatment |
 |---|---:|---:|---|
@@ -271,191 +195,189 @@ metadata and source staging and are not hardware counters.
 | Rank packed | 128 | 16 | Pack selected rows |
 | Rank broadcast | 512 | 16 | Send original dense block |
 
-Broadcast transfers `4 source ranks * 4 destinations * 32 rows = 512` rows
-in this pattern. The 16 starts include 12 remote and four local transfers.
-The count is route-dependent, not a fixed property of broadcast. It sends four
-times the packed payload here, while retaining the same modeled start count.
+- Broadcast rows: `4 sources * 4 destinations * 32 rows = 512`.
+- Its 16 starts comprise **12 remote and four local** transfers.
+- Here it sends **4x the packed payload** with the same modeled start count.
 
-Sources: [scatter implementation](../../../python/sgl_jax/srt/kernels/fused_moe/v2/kernel.py)
-and [routing and traffic models](../../../python/sgl_jax/tools/moe_rank_routing.py).
+**Algorithmic counts only:** these include local copies, exclude metadata/source staging, and are not hardware counters. Counts depend on routing.
+
+Sources: [kernel](../../../python/sgl_jax/srt/kernels/fused_moe/v2/kernel.py) and [traffic models](../../../python/sgl_jax/tools/moe_rank_routing.py).
 
 <!-- pagebreak -->
 
 ## Broadcast measurements and limits
 
-The random-routing comparisons used v6e-4, BF16 activations and weights,
-`H=8192`, `I=1024`, `E=32`, `K=8`, and EP=4. Each pair used identical explicit
-block configurations. Different token counts used different outer block sizes.
+**Setup:** v6e-4, random routing, BF16 activations/weights, `H=8192`, `I=1024`, `E=32`, `K=8`, EP=4. Each pair used identical explicit tiles; outer block sizes varied with `T`.
 
 | Global T | Expert p50 ms | Broadcast p50 ms | Latency change | Evidence |
 |---:|---:|---:|---:|---|
-| 32 | 0.303173 | 0.288712 | 4.77 percent lower | Three A/B pairs |
-| 64 | 0.313143 | 0.300163 | 4.15 percent lower | Three A/B pairs |
-| 128 | 0.448801 | 0.445009 | 0.85 percent lower | Single sweep |
-| 256 | 0.949149 | 0.953810 | 0.49 percent higher | Single sweep |
-| 512 | 2.006105 | 2.037165 | 1.55 percent higher | Single sweep |
+| **32** | 0.303173 | **0.288712** | **4.77% lower** | Three A/B pairs |
+| **64** | 0.313143 | **0.300163** | **4.15% lower** | Three A/B pairs |
+| 128 | 0.448801 | 0.445009 | 0.85% lower | Single sweep |
+| 256 | 0.949149 | 0.953810 | 0.49% higher | Single sweep |
+| 512 | 2.006105 | 2.037165 | 1.55% higher | Single sweep |
 
-At `T=32` and `64`, each value is the median of three run p50s from alternating
-expert/broadcast pairs. Each repeat record retains ten timing samples. At `T=128`,
-`256`, and `512`, values come from the initial crossover sweep with five samples
-per record. Latency change
-is `100 * (broadcast / expert - 1)`. The smaller single-sweep differences do
-not establish statistical significance.
+**The highlighted rows are experimental matched-tile results, not production-relative serving gains.**
 
-### What was controlled and what remains unqualified
+### How to read the numbers
 
-The records identify a dirty experimental revision, synthetic inputs, and
-`matches_production_block_config=false`. Matching explicit tiles between modes
-helps compare communication paths, but the baseline is not the production
-configuration. For example, the `T=32` run used `btc=bts=32`, while the resolved
-production configuration used `btc=bts=8`.
+- `T=32/64`: median of three run p50s from alternating expert/broadcast pairs; **10 samples per repeat record**.
+- `T=128/256/512`: one crossover sweep; **five samples per record**. Small differences do not establish statistical significance.
+- Latency change: `100 * (broadcast / expert - 1)`.
 
-The retained timing records say `correctness_status=not_checked_per_config`.
-Separate numerical checks were reported at `T=128` and `512`; those checks do
-not certify every small-token configuration. No checkpoint-backed serving A/B
-was collected. The table therefore describes a measured experimental region,
-not a validated decode optimization.
+### Qualification gaps
 
-### Why the result may change with token count
+- **Dirty revision and synthetic inputs.** No checkpoint-backed serving A/B.
+- **Non-production tiles:** `matches_production_block_config=false`. At `T=32`, the runs used `btc=bts=32`; production lookup resolved `btc=bts=8`.
+- **No per-configuration correctness check:** records say `not_checked_per_config`. Separate checks at `T=128/512` do not certify every small-token case.
 
-Code inspection shows fewer modeled starts and no ragged source pack, alongside
-extra payload and a rank inbox that still needs expert reconstruction. A
-plausible explanation is that transfer startup and regularity matter more at
-small `T`, while extra rows and destination work absorb that saving as `T`
-grows. Whole-kernel timings do not separate those costs or prove this mechanism.
+### Interpretation and decision
 
-Broadcast remains experimental, with `expert` as the default. A useful next
-comparison must use production-resolved tiles, observed model routing, repeated
-timings, and numerical checks for every tested configuration before measuring
-TTFT, TPOT or ITL, throughput, and memory in a real server.
+- Fewer starts and regular transfers may help at small `T`.
+- Extra payload and receiver work may absorb that saving as `T` grows.
+- **Whole-kernel timing does not isolate those mechanisms.**
 
-Sources: [repeat pair one expert](evidence/rank-broadcast-repeat1_random_t32_64_expert.jsonl),
-[pair one broadcast](evidence/rank-broadcast-repeat1_random_t32_64_rank_broadcast.jsonl),
-[crossover expert](evidence/rank-broadcast-crossover-smoke_random_t32_64_128_256_512_expert.jsonl),
-and [crossover broadcast](evidence/rank-broadcast-crossover-smoke_random_t32_64_128_256_512_rank_broadcast.jsonl).
+Keep broadcast experimental. Recheck exact production tiles, model routing, per-case correctness, and repeated timings before real-server TTFT, TPOT/ITL, throughput, and memory measurements.
+
+Sources: [repeat expert](evidence/rank-broadcast-repeat1_random_t32_64_expert.jsonl), [repeat broadcast](evidence/rank-broadcast-repeat1_random_t32_64_rank_broadcast.jsonl), [crossover expert](evidence/rank-broadcast-crossover-smoke_random_t32_64_128_256_512_expert.jsonl), [crossover broadcast](evidence/rank-broadcast-crossover-smoke_random_t32_64_128_256_512_rank_broadcast.jsonl).
 
 <!-- pagebreak -->
 
 ## Direction 3 Destination combine
 
-### Why we explored combining before the return transfer
+### Idea and implementation
 
-The baseline returns a BF16 output row for every selected expert route, then
-applies the router-weighted sum on the source. Several outputs may come from
-experts on the same rank. Combining those contributions at the destination
-could reduce return traffic as well as source accumulation work.
+The baseline returns one BF16 output row per expert route and weights/sums on the source. **Combine at the destination could return one partial per token/rank pair.**
 
-In `rank_dispatch_combine`, router weights travel with dispatch metadata. The
-destination weights each local expert output, accumulates an FP32 partial for
-each source token, and returns one partial per token/destination-rank pair.
-The source then sums the rank partials. Changing where accumulation happens
-also changes floating-point ordering and requires numerical validation.
+In `rank_dispatch_combine`:
+
+1. Send router weights with dispatch metadata.
+2. Weight local expert outputs and accumulate an **FP32 partial** for each source token.
+3. Return rank partials; sum them on the source.
 
 ![Expert outputs are weighted and accumulated into FP32 rank partials before return to the source](figures/destination_combine.svg)
 
-Figure 5. Destination combine returns one weighted partial per token/rank pair.
-All expert computations remain; moving the sum changes accumulation order and
-return precision.
+Figure 5. All experts still compute. Moving the sum changes accumulation order and return precision.
 
-### Precision changes the byte tradeoff
+### Precision determines byte savings
 
-For BF16 expert outputs, global logical return bytes are `2 * T * K * H`.
-For FP32 rank partials, they are `4 * T * R * H`. Thus the FP32 design reduces
-return bytes only when `R < K / 2`. At Top-K 8, it saves bytes below four ranks
-per token, is neutral at four, and increases bytes above four. For ICI, apply
-the comparison to remote routes and remote rank partials only.
+- BF16 expert return: `2 * T * K * H` bytes.
+- FP32 rank-partial return: `4 * T * R * H` bytes.
+- **Savings require R < K/2.** At Top-K 8, return bytes decrease below four ranks/token, are neutral at four, and increase above four.
+- One-rank routing saves **75% of logical return bytes**, versus **87.5% for BF16 dispatch deduplication**. For ICI, count remote routes/partials only.
 
-With one destination rank per token, the modeled saving is 75 percent for
-FP32 return partials, versus 87.5 percent for BF16 dispatch deduplication.
-Counting only rows would miss this difference.
+### What the historical test establishes
 
-### What we measured and what it tells us
+- **Setup:** v6e-4, BF16, `T=128`, `H=1024`, `E=32`, `K=8`, `I=1024`, one-rank routing.
+- **Complete prototype:** 0.108 ms versus 0.071 ms for `expert` (**52.1% higher latency**).
+- **Numerical check passed:** reported max absolute error 0.0001 and relative error 0.003623.
+- **Evidence strength:** historical single-run means, not repeated paired measurements.
 
-The completed controlled `T=128`, `H=1024`, BF16, one-rank case measured
-0.108 ms for the coupled dispatch/combine prototype versus 0.071 ms for the
-expert baseline, 52.1 percent higher latency. Reported maximum absolute error
-was 0.0001 and relative error was 0.003623; the experiment's numerical check
-passed. These are historical single-run means.
-
-This version inherits packed-dispatch overhead and adds dynamically addressed
-FP32 accumulation. It does not isolate the cost of combine itself. To answer
-that question, an independent destination-combine variant would have to preserve
-expert-major dispatch and readiness while changing only the return path.
-
-### What the communication experiments established
-
-We demonstrated correct prototypes in the reported checked cases, quantified
-how rank overlap changes logical payload, and measured cases where fewer rows
-still produced higher latency. The remaining design problem is how to retain
-expert-ready contiguous inputs and fine-grained readiness after rank transport.
-The experiments do not identify a single dominant overhead without stage traces
-or independent ablations.
+**This comparison changes dispatch and combine together. It does not show that destination combine alone is slower.** It includes packed dispatch, extra weight metadata, FP32 accumulation/return, buffer changes, and synchronization effects.
 
 Source: [combine design and numerical evidence](../../developer_guide/fused_moe_rank_dispatch_consultation_brief.md).
 
 <!-- pagebreak -->
 
+## A controlled combine experiment
+
+### Start with the closest existing control
+
+Compare **rank_dispatch versus rank_dispatch_combine** using the same activation-dispatch algorithm, operands, routes, tiles, and hardware.
+
+- This estimates the **complete combine-protocol change conditional on packed dispatch**.
+- It includes necessary router-weight metadata, FP32 partials, accumulation, return, and changed overlap.
+- It does not isolate scalar additions or raw network savings alone.
+
+The old 0.106 ms and 0.108 ms points differ by about 2 microseconds. **Single-run, rounded, unpaired timings cannot establish a reliable incremental effect.** Rerun this as a controlled paired experiment.
+
+### Isolate the return and combine path
+
+Build a **return/combine-only microbenchmark** from identical precomputed expert outputs, routing IDs, and router weights already resident on the expert ranks.
+
+- Compare expert-row return plus source weighting/sum against destination weighting/sum plus rank-partial return and final source sum.
+- Include each method's required packing, accumulation, transfers, and completion waits. Exclude only common input generation; preserve realistic layouts and precision.
+- This removes activation dispatch and FFN compute from timing. **It diagnoses the return protocol but cannot predict overlap in the fused kernel.**
+
+### Then use a two by two matrix
+
+| Cell | Dispatch | Combine location | Status |
+|---|---|---|---|
+| A | Expert-major | Source | Existing `expert` |
+| B | Rank-packed | Source | Existing `rank_dispatch` |
+| C | Expert-major | Destination | **Proposed and not implemented** |
+| D | Rank-packed | Destination | Existing `rank_dispatch_combine` |
+
+**Cell C must preserve the baseline activation layout and expert readiness.** The current mode flags do not provide this independent combination; adding it requires implementation and validation.
+
+### Questions the matrix answers
+
+- **D versus B:** combine-protocol effect with rank-packed dispatch.
+- **C versus A:** combine-protocol effect with expert-major dispatch.
+- **B versus A:** dispatch effect with source combine.
+- **Interaction:** `(L_D - L_B) - (L_C - L_A)`, where `L` is whole-kernel latency. A nonzero interaction means the combine effect depends on dispatch. Negative latency differences indicate improvement.
+
+Keep each pair's configuration fixed. Tune each complete method independently only in a separate practical-performance study; do not mix tuning gains into this attribution experiment.
+
+**Proposed experiment only:** no new mode or accelerator run was added while preparing this report.
+
+<!-- pagebreak -->
+
+## Measurement and correctness protocol
+
+### Control the comparison
+
+- Use identical activation tensors, expert weights, routing IDs/weights, seeds, shapes, and EP topology within each comparison.
+- Fix tiles, quantization, shared-expert settings, overlap flags, and software/device versions. Save the clean commit and resolved configuration.
+- Count required metadata and buffer work as part of the complete protocol. Record compiler/resource changes rather than assuming the executable differs only in a small arithmetic block.
+
+### Validate every measured configuration
+
+- Check against an **FP32 reference** using predetermined dtype-appropriate absolute/relative tolerances. Changed summation order need not be bit-identical.
+- Cover unequal router weights, empty experts, zero-transfer ranks, padded blocks, skew, high fan-out, and repeated buffer reuse.
+- Record numerical failures, compilation failures, and memory failures alongside successful cases.
+
+### Use paired repeated measurements
+
+1. Compile and warm each variant; exclude compilation, reference computation, and profiling from final timings.
+2. Alternate or randomize A/B order on the same hardware. Measure completed device work, not asynchronous host dispatch alone.
+3. Start with **10 run pairs as a variance pilot**; choose final repetitions for a predeclared minimum useful effect.
+4. Report run-level p50/p95 and paired latency ratios with **95% uncertainty intervals**. Treat a run pair as the resampling unit; samples within a run are correlated.
+5. Predeclare the primary metric and practical gain threshold. Report the full matrix, not only winning shapes.
+
+### Separate effectiveness from mechanism
+
+- Begin with the historical `T=128`, `H=1024` case, then `H=8192`; expand to `T=32/64/128/256/512`, controlled fan-out, random routes, and skew.
+- Above-four-rank fan-out requires EP greater than four. If testing one-rank Top-K routing, ensure each rank owns at least `K` distinct experts.
+- In separate diagnostic runs, inspect metadata, expert-input preparation, accumulation, return DMA, source combine, and exposed waits. **Overlapping stage times cannot simply be added or subtracted to explain fused latency.**
+- Use measured traffic counters when available; otherwise label byte/start counts as models. Report memory footprint and synchronization costs too.
+
+Only candidates that pass correctness and repeated kernel comparisons should proceed to checkpoint-backed serving A/B tests.
+
+<!-- pagebreak -->
+
 ## Findings evidence and next experiments
 
-### Main finding
+### Findings and next actions
 
-The experiments tested complete communication paths, including their local
-consumers. Reduced payload alone did not make the measured packed path faster.
-Broadcast exposed a narrow region where regular transfers helped. A next
-candidate should preserve efficient expert input layout and useful readiness
-while reducing communication; traces and independent ablations are needed to
-identify the exposed cost before claiming a general optimization.
+- **Packed dispatch:** fewer logical rows, but higher completed kernel latency. Revisit local input layout and readiness only after identifying exposed cost.
+- **Broadcast:** a small-token benefit in matched-tile experiments. Recheck production-resolved tiles and actual model routing.
+- **Combine:** the complete packed/combine prototype was slower than `expert`; combine's independent effect remains open. Run the paired control and proposed matrix above.
+- **Serving:** no MoE communication change here has checkpoint-backed qualification. Keep `expert` as the default.
 
-### What we would test next
+### Code and evidence
 
-1. Measure actual per-token rank fan-out, destinations per source block, and
-   expert imbalance for a target checkpoint and serving batch distribution.
-   These determine the useful deduplication and broadcast amplification.
-2. Profile dispatch, local reconstruction, expert-input loads, exposed receive
-   waits, and output return under the same shape and resolved configuration.
-   Logical byte savings are an opportunity model, not a measured time budget.
-3. Recheck the small-token broadcast region against production-resolved expert
-   tiles. Use a clean revision, per-configuration correctness checks, repeated
-   alternating pairs, and p50/p95 reporting. Include routing patterns where
-   broadcast sends many unused rows.
-4. If communication is exposed, test a receiver that produces contiguous expert
-   tiles with segment or tile readiness. Preserve buffer ownership and wait for
-   outstanding transfers before reusing storage. Test destination combine
-   independently only if output return is a material bottleneck.
-5. Qualify a surviving candidate in checkpoint-backed serving. Any selector
-   needs an observed operating region and an `expert` fallback.
+- **Implementation:** [Pallas kernel](../../../python/sgl_jax/srt/kernels/fused_moe/v2/kernel.py), [routing reference](../../../python/sgl_jax/tools/moe_rank_routing.py), [routing tests](../../../python/sgl_jax/test/kernels/fused_moe_rank_routing_test.py).
+- **Experiment tools:** [benchmark](../../../python/sgl_jax/srt/kernels/fused_moe/v2/bench_v2.py) and [TPU runner](../../../scripts/run_fused_moe_rank_a2a_tpu.sh).
+- **Broadcast raw records:** six small-token repeat files and two crossover files in [evidence](evidence/), preserved by the [SHA256 manifest](evidence/manifest.json).
+- **Remaining repeat pairs:** [pair two expert](evidence/rank-broadcast-repeat2_random_t32_64_expert.jsonl), [pair two broadcast](evidence/rank-broadcast-repeat2_random_t32_64_rank_broadcast.jsonl), [pair three expert](evidence/rank-broadcast-repeat3_random_t32_64_expert.jsonl), [pair three broadcast](evidence/rank-broadcast-repeat3_random_t32_64_rank_broadcast.jsonl).
+- **Historical notes:** [consultation brief](../../developer_guide/fused_moe_rank_dispatch_consultation_brief.md) and [deep dive](../../developer_guide/fused_moe_v2_optimization_deep_dive.md). Early packed/combine timings and the qualitative rank-direct diagnostic lack a standalone raw packet in this report's evidence directory.
 
-These are proposed experiments. Preparing this report did not run new TPU jobs
-or change the production default.
+### Recompute the broadcast table
 
-### Where the work and measurements are preserved
+1. Group repeat records by `a2a_mode` and `tokens`.
+2. For `T=32/64`, take the median of `latency_p50_ms` across the three repeats.
+3. For `T=128/256/512`, use the crossover record and retain its weaker evidence label.
+4. Compute change as `100 * (broadcast / expert - 1)`.
 
-The [Pallas kernel](../../../python/sgl_jax/srt/kernels/fused_moe/v2/kernel.py)
-contains all four experimental paths. The
-[CPU routing and traffic reference](../../../python/sgl_jax/tools/moe_rank_routing.py)
-and [routing tests](../../../python/sgl_jax/test/kernels/fused_moe_rank_routing_test.py)
-encode deduplication, source/rank accounting, and combine math. The
-[benchmark](../../../python/sgl_jax/srt/kernels/fused_moe/v2/bench_v2.py) and
-[TPU runner](../../../scripts/run_fused_moe_rank_a2a_tpu.sh) preserve controlled
-routing and numerical-check entry points.
-
-The [evidence directory](evidence/) contains the six small-token repeat files
-and two crossover files. For the remaining repeat pairs, see
-[pair two expert](evidence/rank-broadcast-repeat2_random_t32_64_expert.jsonl),
-[pair two broadcast](evidence/rank-broadcast-repeat2_random_t32_64_rank_broadcast.jsonl),
-[pair three expert](evidence/rank-broadcast-repeat3_random_t32_64_expert.jsonl),
-and [pair three broadcast](evidence/rank-broadcast-repeat3_random_t32_64_rank_broadcast.jsonl).
-The [SHA256 manifest](evidence/manifest.json) records the unmodified evidence.
-
-The [consultation brief](../../developer_guide/fused_moe_rank_dispatch_consultation_brief.md)
-retains initial packed-dispatch and combine results and the qualitative
-rank-direct diagnostic. Those early measurements do not have a standalone raw
-timing packet in this report's evidence directory. The
-[communication sections of the deep dive](../../developer_guide/fused_moe_v2_optimization_deep_dive.md)
-provide additional implementation context.
-
-To reproduce the broadcast table from the retained files, group repeat records
-by `a2a_mode` and `tokens`, take the median of `latency_p50_ms` across repeats
-for `T=32/64`, and use the crossover record for `T=128/256/512`. Keep those two
-evidence strengths distinct. Recomputing this summary does not rerun the device
-experiment or make the historical working revision clean.
+Recomputing these records does not rerun a TPU experiment or make the historical source revision clean.
